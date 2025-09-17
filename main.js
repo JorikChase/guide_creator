@@ -158,13 +158,29 @@ function getChapters(ffmpegPath, filePath) {
     });
 }
 
+/**
+ * Processes a single video file, splitting it by chapters and adding prefixes/suffixes.
+ */
 async function processSingleVideo(ffmpegPath, filePath, chapters, outputDir) {
+    log(`[DEBUG] Starting processSingleVideo for: ${filePath}`);
     const videoInfo = await getVideoInfo(ffmpegPath, filePath);
-    const frameRate = eval(videoInfo.streams[0].r_frame_rate);
+
+    const videoStream = videoInfo.streams.find(s => s.codec_type === 'video');
+    const audioStream = videoInfo.streams.find(s => s.codec_type === 'audio');
+    const hasAudio = !!audioStream;
+    log(`[DEBUG] Audio stream detected: ${hasAudio}`);
+
+    if (!videoStream || !videoStream.r_frame_rate) {
+        throw new Error('Could not determine frame rate for the video.');
+    }
+    
+    const originalFrameRateString = videoStream.r_frame_rate;
+    const frameRate = eval(originalFrameRateString);
     const frameDuration = 1 / frameRate;
     const tenFramesDuration = 10 * frameDuration;
+    log(`[DEBUG] Video Info: FPS=${frameRate} (${originalFrameRateString}), Frame Duration=${frameDuration}s, 10-Frame Duration=${tenFramesDuration}s`);
 
-    // Create a sub-directory for this specific video's output to avoid name collisions
+    const videoDuration = parseFloat(videoInfo.format.duration);
     const videoSpecificOutputDir = path.join(outputDir, path.basename(filePath, path.extname(filePath)));
     if (!fs.existsSync(videoSpecificOutputDir)) {
         fs.mkdirSync(videoSpecificOutputDir, { recursive: true });
@@ -172,96 +188,133 @@ async function processSingleVideo(ffmpegPath, filePath, chapters, outputDir) {
 
     for (let i = 0; i < chapters.length; i++) {
         const chapter = chapters[i];
-        const nextChapter = chapters[i + 1];
-        const clipName = chapter.tags.title.replace(/ /g, '_');
-        const outputFilePath = path.join(videoSpecificOutputDir, `${clipName}.mov`);
+        const clipName = chapter.tags.title.replace(/[ /\\?%*:|"<>]/g, '_');
+        log(`\n--- Processing Chapter ${i + 1}/${chapters.length}: ${clipName} ---`);
 
         const startTime = parseFloat(chapter.start_time);
-        const endTime = nextChapter ? parseFloat(nextChapter.start_time) : parseFloat(videoInfo.format.duration);
+        const endTime = (i < chapters.length - 1) ? parseFloat(chapters[i + 1].start_time) : videoDuration;
+        log(`[DEBUG] Chapter Times: Start=${startTime}s, End=${endTime}s`);
 
-        log(`Processing chapter: ${clipName} | Start: ${startTime} | End: ${endTime}`);
-
-        const complexFilter = [];
-        let inputCount = 1;
-
-        // --- Video Prefix ---
+        const outputFilePath = path.join(videoSpecificOutputDir, `${clipName}.mov`);
         const prefixStillPath = path.join(videoSpecificOutputDir, `prefix_${clipName}.png`);
-        await createStillFrame(ffmpegPath, filePath, startTime, prefixStillPath);
-        complexFilter.push(`[${inputCount}:v]loop=loop=10:size=1:start=0,setpts=PTS-STARTPTS[pre_v]`);
-        inputCount++;
-
-        // --- Main Video Clip ---
-        const mainClipFilter = `[0:v]trim=start=${startTime}:end=${endTime},setpts=PTS-STARTPTS[main_v]`;
-        complexFilter.push(mainClipFilter);
-
-        // --- Video Suffix ---
         const suffixStillPath = path.join(videoSpecificOutputDir, `suffix_${clipName}.png`);
-        await createStillFrame(ffmpegPath, filePath, endTime - frameDuration, suffixStillPath);
-        complexFilter.push(`[${inputCount}:v]loop=loop=10:size=1:start=0,setpts=PTS-STARTPTS[suf_v]`);
-        inputCount++;
+        const metadataFilePath = path.join(videoSpecificOutputDir, `metadata_${clipName}.txt`);
 
-        // --- Audio Prefix ---
-        let audioPrefixFilter = '';
-        if (i > 0) { // Not the first clip
-            const audioPrefixStartTime = Math.max(0, startTime - tenFramesDuration);
-            audioPrefixFilter = `[0:a]atrim=start=${audioPrefixStartTime}:end=${startTime},asetpts=PTS-STARTPTS[pre_a];`;
-            complexFilter.push(audioPrefixFilter);
+        try {
+            log(`[DEBUG] Creating prefix still frame at ${startTime}s -> ${prefixStillPath}`);
+            await createStillFrame(ffmpegPath, filePath, startTime, prefixStillPath);
+
+            // Suffix frame is the last frame of the chapter
+            const suffixTime = endTime - frameDuration;
+            log(`[DEBUG] Creating suffix still frame at ${suffixTime}s -> ${suffixStillPath}`);
+            await createStillFrame(ffmpegPath, filePath, suffixTime, suffixStillPath);
+
+            // Create a metadata file with only the current chapter information
+            const chapterDuration = endTime - startTime;
+            const newChapterStartTime = tenFramesDuration; // Chapter starts after the prefix
+            const newChapterEndTime = newChapterStartTime + chapterDuration;
+            const timebase = 1000000; // Use microseconds for precision
+            const metadataContent = `;FFMETADATA1\n[CHAPTER]\nTIMEBASE=1/${timebase}\nSTART=${Math.round(newChapterStartTime * timebase)}\nEND=${Math.round(newChapterEndTime * timebase)}\ntitle=${chapter.tags.title}\n`;
+            fs.writeFileSync(metadataFilePath, metadataContent);
+
+            const complexFilterParts = [];
+            
+            // --- Video filters ---
+            // Trim main video one frame short to avoid duplicating the last frame which is used for the suffix
+            const videoTrimEndTime = Math.max(startTime, endTime - frameDuration);
+            complexFilterParts.push(`[1:v]loop=loop=9:size=1:start=0,setpts=PTS-STARTPTS[pre_v]`);
+            complexFilterParts.push(`[0:v]trim=start=${startTime}:end=${videoTrimEndTime},setpts=PTS-STARTPTS[main_v]`);
+            complexFilterParts.push(`[2:v]loop=loop=9:size=1:start=0,setpts=PTS-STARTPTS[suf_v]`);
+
+            // --- Audio filters ---
+            if (hasAudio) {
+                const sampleRate = audioStream.sample_rate || '48000';
+                const channelLayout = audioStream.channel_layout || 'stereo';
+                const audioParts = [];
+
+                // 1. Prefix Audio
+                if (i === 0) {
+                    // First chapter: Prepend 10 frames of silence to match the video prefix.
+                    complexFilterParts.push(`anullsrc=r=${sampleRate}:cl=${channelLayout},atrim=duration=${tenFramesDuration},asetpts=PTS-STARTPTS[pre_a]`);
+                } else {
+                    // Subsequent chapters: Use the last 10 frames of the previous section as a handle.
+                    const audioPrefixStartTime = Math.max(0, startTime - tenFramesDuration);
+                    complexFilterParts.push(`[0:a]atrim=start=${audioPrefixStartTime}:end=${startTime},asetpts=PTS-STARTPTS[pre_a]`);
+                }
+                audioParts.push('[pre_a]');
+
+                // 2. Main Audio
+                complexFilterParts.push(`[0:a]atrim=start=${startTime}:end=${endTime},asetpts=PTS-STARTPTS[main_a]`);
+                audioParts.push('[main_a]');
+
+                // 3. Suffix Audio
+                if (i === chapters.length - 1) {
+                    // Last chapter: Append 10 frames of silence.
+                    complexFilterParts.push(`anullsrc=r=${sampleRate}:cl=${channelLayout},atrim=duration=${tenFramesDuration},asetpts=PTS-STARTPTS[suf_a]`);
+                } else {
+                    // Other chapters: Use the first 10 frames of the next section as a handle.
+                    const audioSuffixEndTime = Math.min(videoDuration, endTime + tenFramesDuration);
+                    complexFilterParts.push(`[0:a]atrim=start=${endTime}:end=${audioSuffixEndTime},asetpts=PTS-STARTPTS[suf_a]`);
+                }
+                audioParts.push('[suf_a]');
+                
+                // Concatenate all audio parts
+                complexFilterParts.push(`${audioParts.join('')}concat=n=${audioParts.length}:v=0:a=1[out_a]`);
+            }
+
+            // --- Concatenate and Finalize ---
+            complexFilterParts.push(`[pre_v][main_v][suf_v]concat=n=3:v=1,fps=${originalFrameRateString}[out_v]`);
+            
+            const filterComplexString = complexFilterParts.join(';');
+            log(`[DEBUG] Filter_complex string: ${filterComplexString}`);
+
+            const ffmpegArgs = [
+                '-i', filePath,                                               // input 0: original video
+                '-framerate', originalFrameRateString, '-i', prefixStillPath,  // input 1: prefix image
+                '-framerate', originalFrameRateString, '-i', suffixStillPath,  // input 2: suffix image
+                '-i', metadataFilePath,                                        // input 3: new chapter metadata
+                '-filter_complex', filterComplexString,
+                '-map', '[out_v]'
+            ];
+            
+            if (hasAudio) {
+                ffmpegArgs.push('-map', '[out_a]');
+            }
+        
+            ffmpegArgs.push(
+                '-map_chapters', '3', // Use chapters from metadata file (input 3)
+                '-c:v', 'prores_ks', '-profile:v', '3'
+            );
+        
+            if (hasAudio) {
+                 ffmpegArgs.push('-c:a', 'pcm_s16le');
+            }
+        
+            ffmpegArgs.push(
+                '-y',
+                outputFilePath
+            );
+
+            log(`Running FFmpeg command: ${ffmpegPath} ${ffmpegArgs.join(' ')}`);
+            await runFfmpeg(ffmpegPath, ffmpegArgs);
+            log(`--- Successfully created: ${outputFilePath} ---\n`);
+
+        } catch (error) {
+            log(`[ERROR] Failed to process chapter ${clipName}. Error: ${error.message}`);
+            throw error;
+        } finally {
+            log(`[DEBUG] Cleaning up temporary files for ${clipName}`);
+            if (fs.existsSync(prefixStillPath)) fs.unlinkSync(prefixStillPath);
+            if (fs.existsSync(suffixStillPath)) fs.unlinkSync(suffixStillPath);
+            if (fs.existsSync(metadataFilePath)) fs.unlinkSync(metadataFilePath);
         }
-
-        // --- Main Audio Clip ---
-        const mainAudioFilter = `[0:a]atrim=start=${startTime}:end=${endTime},asetpts=PTS-STARTPTS[main_a]`;
-        complexFilter.push(mainAudioFilter);
-
-        // --- Audio Suffix ---
-        let audioSuffixFilter = '';
-        if (i < chapters.length - 1) { // Not the last clip
-            const audioSuffixEndTime = Math.min(parseFloat(videoInfo.format.duration), endTime + tenFramesDuration);
-            audioSuffixFilter = `[0:a]atrim=start=${endTime}:end=${audioSuffixEndTime},asetpts=PTS-STARTPTS[suf_a];`;
-            complexFilter.push(audioSuffixFilter);
-        }
-
-        // --- Concatenation ---
-        const videoConcat = `[pre_v][main_v][suf_v]concat=n=3:v=1[out_v]`;
-        complexFilter.push(videoConcat);
-
-        let audioConcat = '';
-        if (i > 0 && i < chapters.length - 1) {
-            audioConcat = `[pre_a][main_a][suf_a]concat=n=3:v=0:a=1[out_a]`;
-        } else if (i > 0) {
-            audioConcat = `[pre_a][main_a]concat=n=2:v=0:a=1[out_a]`;
-        } else if (i < chapters.length - 1) {
-            audioConcat = `[main_a][suf_a]concat=n=2:v=0:a=1[out_a]`;
-        } else {
-            audioConcat = `[main_a]anull[out_a]`; // Just pass through main audio if no prefix/suffix
-        }
-        complexFilter.push(audioConcat);
-
-        const ffmpegArgs = [
-            '-i', filePath,
-            '-i', prefixStillPath,
-            '-i', suffixStillPath,
-            '-filter_complex', complexFilter.join(';'),
-            '-map', '[out_v]',
-            '-map', '[out_a]',
-            '-c:v', 'prores_ks', '-profile:v', '3',
-            '-c:a', 'pcm_s16le',
-            '-y',
-            outputFilePath
-        ];
-
-        log(`Running FFmpeg command: ${ffmpegPath} ${ffmpegArgs.join(' ')}`);
-
-        await runFfmpeg(ffmpegPath, ffmpegArgs);
-        log(`Successfully created: ${outputFilePath}`);
-
-        // Cleanup still images
-        fs.unlinkSync(prefixStillPath);
-        fs.unlinkSync(suffixStillPath);
     }
 }
 
 function createStillFrame(ffmpegPath, filePath, time, outputPath) {
-    const args = ['-ss', time, '-i', filePath, '-vframes', '1', '-y', outputPath];
+    const seekTime = Math.max(0, time);
+    const args = ['-ss', seekTime.toString(), '-i', filePath, '-vframes', '1', '-y', outputPath];
+    log(`[DEBUG] createStillFrame command: ${ffmpegPath} ${args.join(' ')}`);
     return runFfmpeg(ffmpegPath, args);
 }
 
@@ -285,7 +338,6 @@ function getVideoInfo(ffmpegPath, filePath) {
         });
     });
 }
-
 
 function runFfmpeg(ffmpegPath, args) {
     return new Promise((resolve, reject) => {
