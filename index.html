@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>FFmpeg Guide Creator</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="container">
+        <div class="title-bar">
+            <div class="title">FFMPEG GUIDE CREATOR</div>
+            <button id="close-btn" class="close-btn">&times;</button>
+        </div>
+        <div id="drag-drop-area" class="drag-drop-area">
+            <p>DRAG & DROP .MOV FILES</p>
+            <p>OR</p>
+            <button id="browse-btn" class="action-btn">BROWSE</button>
+        </div>
+        <div id="file-list" class="file-list"></div>
+        
+        <!-- Added section for output directory selection -->
+        <div class="output-dir-container">
+            <button id="output-dir-btn" class="action-btn">OUTPUT DIRECTORY</button>
+            <div id="output-dir-path" class="path-display">No directory selected.</div>
+        </div>
+
+        <button id="process-btn" class="action-btn process-btn" disabled>PROCESS</button>
+<br>
+        <!-- Wrapper for scrollable status and log -->
+        <div class="status-log-scroll-container">
+            <div class="status-container">
+                <h3>STATUS</h3>
+                <div id="status" class="status">IDLE</div>
+            </div>
+    
+            <div class="log-container">
+                <h3>LOG</h3>
+                <pre id="log-output" class="log-output"></pre>
+            </div>
+        </div>
+    </div>
+    <script src="renderer.js"></script>
+</body>
+</html>
