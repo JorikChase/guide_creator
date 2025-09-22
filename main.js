@@ -111,7 +111,7 @@ function splitCsvToLines(csvString) {
 // Fetches and parses the Google Sheet data.
 ipcMain.handle('fetch-sheet-data', () => {
     return new Promise((resolve, reject) => {
-        const sheetUrl = 'https://docs.google.com/spreadsheets/d/1RC8PvCsNkDc3Tcsjp8Rqb4rKRbXXw_wtbGPy-r7A3-s/gviz/tq?tqx=out:csv&sheet=SHOT%20LIST';
+        const sheetUrl = 'https://docs.google.com/spreadsheets/d/17W-uNf2bpFf2rhn1rCMgYEsBVbvr8UWpyJgHmJQ5gBw/gviz/tq?tqx=out:csv&sheet=guide_creator-export';
         log(`Fetching Google Sheet data from: ${sheetUrl}`);
 
         https.get(sheetUrl, (res) => {
@@ -128,59 +128,59 @@ ipcMain.handle('fetch-sheet-data', () => {
                 try {
                     log('Successfully fetched Google Sheet data. Parsing...');
                     
-                    // Use the new robust line splitter instead of a simple split('\n')
                     const lines = splitCsvToLines(rawData);
 
-                    // Handle potential UTF-8 BOM character at the start of the file
                     if (lines[0] && lines[0].charCodeAt(0) === 0xFEFF) {
                         lines[0] = lines[0].substring(1);
                     }
 
-                    // The first row is the header row.
                     if (lines.length < 1) {
                         return reject(new Error('CSV data is empty. Cannot find header row.'));
                     }
-                    const headerLine = lines.shift() || ''; // Get header and remove it from lines array
+                    const headerLine = lines.shift() || '';
 
                     const headerNames = parseCsvLine(headerLine).map(h => h.replace(/^"|"$/g, '').trim());
                     log(`Using headers: [${headerNames.join(', ')}]`);
 
-                    // Define the column names we need to find within the header row
-                    const requiredShotIdHeader = 'SHOT ID';
-                    const requiredEnviroHeader = 'ENVIRO';
+                    // Define the new column names we need
+                    const requiredIdHeader = 'ID';
+                    const requiredGuideNameHeader = 'GUIDE_NAME';
+                    const requiredPathHeader = 'PATH';
 
-                    // Find the index of our required columns using the parsed headers (case-insensitive)
-                    const shotIdIndex = headerNames.findIndex(h => h.toUpperCase() === requiredShotIdHeader.toUpperCase());
-                    const enviroIndex = headerNames.findIndex(h => h.toUpperCase() === requiredEnviroHeader.toUpperCase());
+                    // Find the index of our required columns
+                    const idIndex = headerNames.findIndex(h => h.toUpperCase() === requiredIdHeader.toUpperCase());
+                    const guideNameIndex = headerNames.findIndex(h => h.toUpperCase() === requiredGuideNameHeader.toUpperCase());
+                    const pathIndex = headerNames.findIndex(h => h.toUpperCase() === requiredPathHeader.toUpperCase());
 
-                    if (shotIdIndex === -1 || enviroIndex === -1) {
+                    if (idIndex === -1 || guideNameIndex === -1 || pathIndex === -1) {
                         const missing = [];
-                        if (shotIdIndex === -1) missing.push(`"${requiredShotIdHeader}"`);
-                        if (enviroIndex === -1) missing.push(`"${requiredEnviroHeader}"`);
-                        const errorMsg = `Could not find required columns ${missing.join(' or ')} in the sheet. The headers found were: [${headerNames.join(', ')}]`;
+                        if (idIndex === -1) missing.push(`"${requiredIdHeader}"`);
+                        if (guideNameIndex === -1) missing.push(`"${requiredGuideNameHeader}"`);
+                        if (pathIndex === -1) missing.push(`"${requiredPathHeader}"`);
+                        const errorMsg = `Could not find required columns ${missing.join(', ')} in the sheet. Headers found: [${headerNames.join(', ')}]`;
                         log(`[ERROR] ${errorMsg}`);
                         return reject(new Error(errorMsg));
                     }
 
                     const shotDataMap = {};
-                    // Process the rest of the lines as data rows
                     lines.forEach((line, rowIndex) => {
-                        // Trim whitespace from data columns, which is important for matching
                         const columns = parseCsvLine(line).map(c => c.replace(/^"|"$/g, '').trim());
                         
-                        // Check if the row has enough columns before accessing by index
-                        if (columns.length <= Math.max(shotIdIndex, enviroIndex)) {
-                            // Don't log empty lines as warnings
+                        if (columns.length <= Math.max(idIndex, guideNameIndex, pathIndex)) {
                             if (line.trim() !== '') {
                                 log(`[WARNING] Skipping row ${rowIndex + 2} due to insufficient columns: "${line}"`);
                             }
-                            return; // continue to next iteration
+                            return;
                         }
 
-                        const shotId = columns[shotIdIndex];
-                        const enviro = columns[enviroIndex];
-                        if (shotId) {
-                            shotDataMap[shotId] = enviro || 'UNKNOWN'; // Default if empty
+                        const id = columns[idIndex];
+                        const guideName = columns[guideNameIndex];
+                        const path = columns[pathIndex];
+                        if (id) {
+                            shotDataMap[id] = {
+                                guideName: guideName || 'UNKNOWN_GUIDE_NAME',
+                                path: path || 'UNKNOWN_PATH'
+                            };
                         }
                     });
                     log(`Parsed ${Object.keys(shotDataMap).length} data rows from the sheet.`);
@@ -492,3 +492,4 @@ function runFfmpeg(ffmpegPath, args) {
         ffmpeg.on('error', (err) => reject(err));
     });
 }
+

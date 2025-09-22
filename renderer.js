@@ -16,30 +16,6 @@ document.addEventListener('DOMContentLoaded', () => {
     let filePaths = [];
     let chapters = []; // To store the analyzed chapters
 
-    /**
-     * Compares a long string format "part1-name-part2" with a short one "part1-part2".
-     *
-     * @param {string} csvString - The string from the CSV, e.g., "sc01-alpha-sh010".
-     * @param {string} localString - The local string to check against, e.g., "sc01-sh010".
-     * @returns {boolean} - True if the first and last parts match, otherwise false.
-     */
-    function areStringsMatching(csvString, localString) {
-        const parts = csvString.split('-');
-
-        // Check if the string has at least a start and end part.
-        // We use >= 2 because "sc01-sh010" would split into 2 parts.
-        if (parts.length < 2) {
-            return false;
-        }
-
-        // Construct the key from the first and last parts of the CSV string.
-        // Using parts.length - 1 is robust and handles names with hyphens.
-        const generatedKey = `${parts[0]}-${parts[parts.length - 1]}`;
-
-        // Perform a direct, case-sensitive comparison.
-        return generatedKey === localString;
-    }
-
     function log(message) {
         console.log(message);
         window.electronAPI.log(message);
@@ -161,7 +137,6 @@ document.addEventListener('DOMContentLoaded', () => {
             logOutput.textContent = '';
             processBtn.disabled = true;
             analyzeBtn.disabled = true;
-            // The chapter titles are now base names; the main process will version them.
             window.electronAPI.processVideos({ chapters: chapters });
         } else {
             log("Cannot process: No chapters have been analyzed.");
@@ -197,42 +172,24 @@ document.addEventListener('DOMContentLoaded', () => {
             let renamedCount = 0;
             chapters.forEach(chapter => {
                 const originalTitle = chapter.title; // e.g., "sc01-sh010"
-                let baseTitle = originalTitle; // Default to original title
                 
-                let enviro = null;
-                let matchingCsvKey = null;
-
-                // Find the key in the sheet data that matches the chapter title's format.
-                for (const csvKey in shotDataMap) {
-                    if (areStringsMatching(csvKey, originalTitle)) {
-                        enviro = shotDataMap[csvKey];
-                        matchingCsvKey = csvKey;
-                        break; // Found our match.
-                    }
-                }
+                // New, simplified matching logic using the ID column
+                const sheetData = shotDataMap[originalTitle];
                 
-                if (enviro) {
-                    const titleParts = originalTitle.split('-');
-                    if (titleParts.length === 2) {
-                        const newTitle = `${titleParts[0]}-${enviro.replace(/\s+/g, '_')}-${titleParts[1]}`;
-                        baseTitle = newTitle; // Update baseTitle if match is successful
-                        chapter.originalTitle = matchingCsvKey; // Store the full original name from the sheet for reference
-                        renamedCount++;
-                        log(`Success: Matched chapter "${originalTitle}" with sheet row "${matchingCsvKey}". Base name is now "${baseTitle}".`);
-                    } else {
-                        log(`[ERROR] Chapter "${originalTitle}" matched, but its format is unexpected. Using original name.`);
-                    }
+                if (sheetData) {
+                    // Use the GUIDE_NAME for the title and store the PATH
+                    chapter.title = sheetData.guideName;
+                    chapter.path = sheetData.path;
+                    chapter.originalTitle = originalTitle; // Store original for reference
+                    renamedCount++;
+                    log(`Success: Matched ID "${originalTitle}". New name is "${sheetData.guideName}".`);
                 } else {
-                    log(`[WARNING] No match found for chapter "${originalTitle}" in the Google Sheet. Using original name.`);
+                    log(`[WARNING] No match found for ID "${originalTitle}" in the Google Sheet. Using original name.`);
+                    // chapter.title remains originalTitle, chapter.path will be undefined
                 }
-
-                // Construct the base name for the chapter, without versioning.
-                chapter.title = `3212-${baseTitle}-guide`;
-                log(`Base name for chapter from "${originalTitle}" is set to "${chapter.title}".`);
             });
 
-
-            statusDiv.textContent = `Renamed ${renamedCount} of ${chapters.length} chapters. Ready to process.`;
+            statusDiv.textContent = `Found matches for ${renamedCount} of ${chapters.length} chapters. Ready to process.`;
         } catch (error) {
             log(`[ERROR] Failed to fetch or process Google Sheet data: ${error.message}`);
             statusDiv.textContent = `Error fetching sheet data: ${error.message}. Using original names.`;
@@ -249,23 +206,31 @@ document.addEventListener('DOMContentLoaded', () => {
             chapterItem.className = 'chapter-item';
             chapterItem.dataset.chapterId = chapter.id;
 
+            const chapterInfo = document.createElement('div');
+            chapterInfo.className = 'chapter-info';
+
             const chapterName = document.createElement('span');
             chapterName.className = 'chapter-name';
             
             const filePrefix = filePaths.length > 1 ? `[${chapter.fileName.split(/[\\/]/).pop()}] ` : '';
-            // Display the base name initially
             const displayName = chapter.title; 
-            // Show full original name from sheet on hover if it was changed
-            const hoverTitle = chapter.originalTitle ? `Original: ${chapter.originalTitle}` : displayName;
+            const hoverTitle = chapter.originalTitle ? `Original ID: ${chapter.originalTitle}` : displayName;
             
             chapterName.textContent = `${filePrefix}${displayName}`;
-            chapterName.title = `${filePrefix}${hoverTitle}`;
+            chapterName.title = hoverTitle;
+
+            const chapterPath = document.createElement('div');
+            chapterPath.className = 'chapter-path';
+            chapterPath.textContent = chapter.path || 'Path not available';
+
+            chapterInfo.appendChild(chapterName);
+            chapterInfo.appendChild(chapterPath);
 
             const chapterStatus = document.createElement('span');
             chapterStatus.className = 'chapter-status chapter-status-ready';
             chapterStatus.textContent = 'Ready';
 
-            chapterItem.appendChild(chapterName);
+            chapterItem.appendChild(chapterInfo);
             chapterItem.appendChild(chapterStatus);
             chapterListDiv.appendChild(chapterItem);
         });
@@ -276,12 +241,10 @@ document.addEventListener('DOMContentLoaded', () => {
         if (chapterItem) {
             const chapter = chapters.find(c => c.id === update.chapterId);
 
-            // If the main process sends the final, versioned name, update the UI
             if (update.finalName && chapter) {
                 const chapterNameEl = chapterItem.querySelector('.chapter-name');
                 const filePrefix = filePaths.length > 1 ? `[${chapter.fileName.split(/[\\/]/).pop()}] ` : '';
                 chapterNameEl.textContent = `${filePrefix}${update.finalName}`;
-                // Also update the title in our local state so it's consistent
                 chapter.title = update.finalName;
             }
 
