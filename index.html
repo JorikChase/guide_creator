@@ -6,36 +6,44 @@
     <link rel="stylesheet" href="style.css">
 </head>
 <body>
-    <div class="container">
-        <div class="title-bar">
-            <div class="title">FFMPEG GUIDE CREATOR</div>
-            <button id="close-btn" class="close-btn">&times;</button>
-        </div>
-        <div id="drag-drop-area" class="drag-drop-area">
-            <p>DRAG & DROP .MOV FILES</p>
-            <p>OR</p>
-            <button id="browse-btn" class="action-btn">BROWSE</button>
-        </div>
-        <div id="file-list" class="file-list"></div>
+    <div class="snap-container">
+        <section id="main-section">
+            <div class="container">
+                <div class="title-bar">
+                    <div class="title">FFMPEG GUIDE CREATOR</div>
+                    <button id="close-btn" class="close-btn">&times;</button>
+                </div>
+                <div id="drag-drop-area" class="drag-drop-area">
+                    <p>DRAG & DROP .MOV FILES</p>
+                    <p>OR</p>
+                    <button id="browse-btn" class="action-btn">BROWSE</button>
+                </div>
+                <div id="file-list" class="file-list"></div>
+                
+                <button id="analyze-btn" class="action-btn" disabled>ANALYZE</button>
+                <div id="chapter-list" class="chapter-list"></div>
         
-        <!-- Replaced output directory section with analyze button and chapter list -->
-        <button id="analyze-btn" class="action-btn" disabled>ANALYZE</button>
-        <div id="chapter-list" class="chapter-list"></div>
+                <!-- Process buttons are now at the bottom of this flex container -->
+                <button id="process-btn" class="action-btn process-btn" disabled>PROCESS</button>
+                <div id="processing-controls" class="processing-controls-container hidden">
+                    <button id="pause-btn" class="action-btn pause-btn">PAUSE</button>
+                    <button id="stop-btn" class="action-btn stop-btn">STOP</button>
+                </div>
+            </div>
+        </section>
 
-        <button id="process-btn" class="action-btn process-btn" disabled>PROCESS</button>
-<br>
-        <!-- Wrapper for scrollable status and log -->
-        <div class="status-log-scroll-container">
-            <div class="status-container">
-                <h3>STATUS</h3>
-                <div id="status" class="status">IDLE</div>
+        <section id="log-section">
+            <div class="status-log-scroll-container">
+                <div class="status-container">
+                    <h3>STATUS</h3>
+                    <div id="status" class="status">IDLE</div>
+                </div>
+                <div class="log-container">
+                    <h3>LOG</h3>
+                    <pre id="log-output" class="log-output"></pre>
+                </div>
             </div>
-    
-            <div class="log-container">
-                <h3>LOG</h3>
-                <pre id="log-output" class="log-output"></pre>
-            </div>
-        </div>
+        </section>
     </div>
     <script src="renderer.js"></script>
 </body>

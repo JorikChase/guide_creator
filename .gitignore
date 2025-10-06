@@ -3,3 +3,7 @@ input/
 output/
 node_modules/
 package-lock.json
+dist/
+release-builds/
+out/
+.electron/

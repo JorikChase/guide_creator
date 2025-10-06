@@ -7,14 +7,17 @@ document.addEventListener('DOMContentLoaded', () => {
     const fileListDiv = document.getElementById('file-list');
     const statusDiv = document.getElementById('status');
     const logOutput = document.getElementById('log-output');
-    const statusLogScrollContainer = document.querySelector('.status-log-scroll-container');
     const analyzeBtn = document.getElementById('analyze-btn');
     const chapterListDiv = document.getElementById('chapter-list');
     const processBtn = document.getElementById('process-btn');
+    const processingControls = document.getElementById('processing-controls');
+    const pauseBtn = document.getElementById('pause-btn');
+    const stopBtn = document.getElementById('stop-btn');
     
     // --- State Variables ---
     let filePaths = [];
     let chapters = []; // To store the analyzed chapters
+    let isProcessing = false;
 
     function log(message) {
         console.log(message);
@@ -24,9 +27,10 @@ document.addEventListener('DOMContentLoaded', () => {
     function updateButtonStates() {
         const hasFiles = filePaths.length > 0;
         const hasChapters = chapters.length > 0;
+        const hasSelectedChapters = chapters.some(c => c.selected);
         
-        analyzeBtn.disabled = !hasFiles;
-        processBtn.disabled = !hasChapters;
+        analyzeBtn.disabled = !hasFiles || isProcessing;
+        processBtn.disabled = !hasChapters || !hasSelectedChapters || isProcessing;
     }
 
     // --- File Handling (Drag/Drop, Browse) ---
@@ -78,7 +82,6 @@ document.addEventListener('DOMContentLoaded', () => {
                 filePaths.push(path);
             }
         });
-        // Clear previous analysis results when new files are added
         chapters = [];
         chapterListDiv.innerHTML = '';
         updateFileList();
@@ -86,9 +89,11 @@ document.addEventListener('DOMContentLoaded', () => {
 
     function removeFile(pathToRemove) {
         filePaths = filePaths.filter(p => p !== pathToRemove);
-        // Clear previous analysis results if files change
         chapters = [];
         chapterListDiv.innerHTML = '';
+        if (filePaths.length === 0) {
+            dragDropArea.classList.remove('shrunk');
+        }
         updateFileList();
     }
 
@@ -125,28 +130,60 @@ document.addEventListener('DOMContentLoaded', () => {
             statusDiv.textContent = 'Analyzing...';
             analyzeBtn.disabled = true;
             processBtn.disabled = true;
-            chapterListDiv.innerHTML = ''; // Clear previous list
+            chapterListDiv.innerHTML = '';
             window.electronAPI.analyzeVideos(filePaths);
         }
     });
 
     processBtn.addEventListener('click', () => {
-        if (chapters.length > 0) {
-            log('Starting chapter processing...');
+        const selectedChapters = chapters.filter(c => c.selected);
+        if (selectedChapters.length > 0) {
+            log(`Starting processing for ${selectedChapters.length} selected chapters...`);
             statusDiv.textContent = 'Processing...';
             logOutput.textContent = '';
-            processBtn.disabled = true;
-            analyzeBtn.disabled = true;
-            window.electronAPI.processVideos({ chapters: chapters });
+
+            isProcessing = true;
+            updateButtonStates();
+            processBtn.classList.add('hidden');
+            processingControls.classList.remove('hidden');
+            pauseBtn.textContent = 'PAUSE';
+            stopBtn.disabled = false;
+
+            window.electronAPI.processVideos({ chapters: selectedChapters });
         } else {
-            log("Cannot process: No chapters have been analyzed.");
+            log("Cannot process: No chapters have been selected.");
         }
     });
+
+    pauseBtn.addEventListener('click', () => {
+        if (pauseBtn.textContent === 'PAUSE') {
+            window.electronAPI.controlProcessing('pause');
+            pauseBtn.textContent = 'RESUME';
+        } else {
+            window.electronAPI.controlProcessing('resume');
+            pauseBtn.textContent = 'PAUSE';
+        }
+    });
+
+    stopBtn.addEventListener('click', () => {
+        log('Stop button clicked. Requesting to stop processing...');
+        stopBtn.disabled = true; // Prevent multiple clicks
+        window.electronAPI.controlProcessing('stop');
+    });
+
+    function resetProcessingUI() {
+        isProcessing = false;
+        processingControls.classList.add('hidden');
+        processBtn.classList.remove('hidden');
+        dragDropArea.classList.remove('shrunk');
+        updateButtonStates();
+    }
 
     // --- IPC Listeners from Main Process ---
     window.electronAPI.onLogMessage((message) => {
         logOutput.textContent += message + '\n';
-        statusLogScrollContainer.scrollTop = statusLogScrollContainer.scrollHeight;
+        // Correctly scroll the log output element, not its parent
+        logOutput.scrollTop = logOutput.scrollHeight;
     });
 
     window.electronAPI.onUpdateStatus((status) => {
@@ -154,7 +191,12 @@ document.addEventListener('DOMContentLoaded', () => {
     });
 
     window.electronAPI.onAnalyzeComplete(async (analysisResult) => {
-        chapters = analysisResult;
+        chapters = analysisResult.map(chapter => ({ ...chapter, selected: true }));
+
+        if (chapters.length > 0) {
+            dragDropArea.classList.add('shrunk');
+        }
+
         if (chapters.length === 0) {
             statusDiv.textContent = 'No chapters found in the selected files.';
             updateButtonStates();
@@ -163,7 +205,7 @@ document.addEventListener('DOMContentLoaded', () => {
         
         statusDiv.textContent = `Found ${chapters.length} chapters. Fetching additional data from Google Sheets...`;
         log(`Found ${chapters.length} chapters locally. Now fetching Google Sheet data.`);
-        chapterListDiv.innerHTML = ''; // Clear list while fetching
+        chapterListDiv.innerHTML = '';
 
         try {
             const shotDataMap = await window.electronAPI.fetchSheetData();
@@ -171,21 +213,18 @@ document.addEventListener('DOMContentLoaded', () => {
 
             let renamedCount = 0;
             chapters.forEach(chapter => {
-                const originalTitle = chapter.title; // e.g., "sc01-sh010"
-                
-                // New, simplified matching logic using the ID column
+                const originalTitle = chapter.title;
                 const sheetData = shotDataMap[originalTitle];
                 
                 if (sheetData) {
-                    // Use the GUIDE_NAME for the title and store the PATH
                     chapter.title = sheetData.guideName;
                     chapter.path = sheetData.path;
-                    chapter.originalTitle = originalTitle; // Store original for reference
+                    chapter.originalTitle = originalTitle;
                     renamedCount++;
                     log(`Success: Matched ID "${originalTitle}". New name is "${sheetData.guideName}".`);
                 } else {
                     log(`[WARNING] No match found for ID "${originalTitle}" in the Google Sheet. Using original name.`);
-                    // chapter.title remains originalTitle, chapter.path will be undefined
+                    chapter.originalTitle = originalTitle; // Still store it for unmatched items
                 }
             });
 
@@ -201,10 +240,36 @@ document.addEventListener('DOMContentLoaded', () => {
 
     function renderChapterList() {
         chapterListDiv.innerHTML = '';
-        chapters.forEach((chapter) => {
+        chapters.forEach((chapter, index) => {
             const chapterItem = document.createElement('div');
             chapterItem.className = 'chapter-item';
             chapterItem.dataset.chapterId = chapter.id;
+            
+            // Add initial class if not selected
+            if (!chapter.selected) {
+                chapterItem.classList.add('unchecked');
+            }
+
+            // --- Checkbox ---
+            const checkboxContainer = document.createElement('label');
+            checkboxContainer.className = 'checkbox-container';
+
+            const checkbox = document.createElement('input');
+            checkbox.type = 'checkbox';
+            checkbox.checked = chapter.selected;
+            checkbox.addEventListener('change', () => {
+                chapters[index].selected = checkbox.checked;
+                // Toggle class on the parent chapter item
+                chapterItem.classList.toggle('unchecked', !checkbox.checked);
+                updateButtonStates();
+            });
+
+            const customCheckbox = document.createElement('span');
+            customCheckbox.className = 'custom-checkbox';
+
+            checkboxContainer.appendChild(checkbox);
+            checkboxContainer.appendChild(customCheckbox);
+            // --- End Checkbox ---
 
             const chapterInfo = document.createElement('div');
             chapterInfo.className = 'chapter-info';
@@ -230,6 +295,7 @@ document.addEventListener('DOMContentLoaded', () => {
             chapterStatus.className = 'chapter-status chapter-status-ready';
             chapterStatus.textContent = 'Ready';
 
+            chapterItem.appendChild(checkboxContainer); // Add checkbox to the item
             chapterItem.appendChild(chapterInfo);
             chapterItem.appendChild(chapterStatus);
             chapterListDiv.appendChild(chapterItem);
@@ -240,8 +306,9 @@ document.addEventListener('DOMContentLoaded', () => {
         const chapterItem = chapterListDiv.querySelector(`[data-chapter-id="${update.chapterId}"]`);
         if (chapterItem) {
             const chapter = chapters.find(c => c.id === update.chapterId);
+            if (!chapter) return;
 
-            if (update.finalName && chapter) {
+            if (update.finalName) {
                 const chapterNameEl = chapterItem.querySelector('.chapter-name');
                 const filePrefix = filePaths.length > 1 ? `[${chapter.fileName.split(/[\\/]/).pop()}] ` : '';
                 chapterNameEl.textContent = `${filePrefix}${update.finalName}`;
@@ -255,6 +322,27 @@ document.addEventListener('DOMContentLoaded', () => {
             if (update.message) {
                  statusDiv.textContent = update.message;
             }
+
+            if (update.status === 'Done') {
+                const durationEl = document.createElement('div');
+                durationEl.className = 'chapter-duration';
+                durationEl.textContent = `Duration: ${update.durationSeconds}s / ${update.durationFrames}f`;
+                
+                let chapterInfo = chapterItem.querySelector('.chapter-info');
+                chapterInfo.appendChild(durationEl);
+
+                if (chapter.originalTitle) {
+                    log(`Chapter "${chapter.title}" finished. Sending data to Google Sheet for ID "${chapter.originalTitle}".`);
+                    window.electronAPI.updateSheetData({
+                        originalTitle: chapter.originalTitle,
+                        dur_f: update.durationFrames,
+                        dur_s: update.durationSeconds,
+                        guide_version: update.guide_version
+                    });
+                } else {
+                    log(`Chapter "${chapter.title}" finished, but has no originalTitle. Cannot update Google Sheet.`);
+                }
+            }
         }
     });
 
@@ -264,12 +352,18 @@ document.addEventListener('DOMContentLoaded', () => {
         chapters = [];
         updateFileList();
         chapterListDiv.innerHTML = '';
-        updateButtonStates();
+        resetProcessingUI();
+    });
+
+    window.electronAPI.onProcessingStopped(() => {
+        statusDiv.textContent = 'Processing stopped by user.';
+        log('UI updated after processing was stopped.');
+        resetProcessingUI();
     });
     
     window.electronAPI.onProcessingError((errorMsg) => {
         statusDiv.textContent = `Error: ${errorMsg}`;
-        analyzeBtn.disabled = filePaths.length === 0;
-        processBtn.disabled = chapters.length === 0;
+        resetProcessingUI();
     });
 });
+

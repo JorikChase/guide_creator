@@ -1,11 +1,40 @@
 // main.js - Main Electron process
+
+// Handle creating/removing shortcuts on Windows when installing/uninstalling.
+// This is required for packages created with the squirrel maker.
+if (require('electron-squirrel-startup')) {
+  app.quit();
+}
+
 const { app, BrowserWindow, ipcMain, dialog } = require('electron');
 const path = require('path');
 const { spawn } = require('child_process');
 const fs = require('fs');
 const https = require('https');
 
+const GOOGLE_APPS_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbz9I11vPIkxX-mEyUk2tMLCSC01t9p4lFnTSaFbDTozIUlBTjMmuWtxzPspvTSitoIh/exec';
+
 let mainWindow;
+
+// --- State Management for Processing ---
+let currentFfmpegProcess = null;
+let processingState = {
+    isProcessing: false,
+    isPaused: false,
+    shouldStop: false,
+};
+
+// --- Helper for binary paths ---
+const isDev = !app.isPackaged;
+const getBinaryPath = (binaryName) => {
+    if (isDev) {
+        // In development, assume 'bin' is in the project root
+        return path.join(__dirname, 'bin', binaryName);
+    }
+    // In a packaged app, binaries are in the 'resources/bin' directory.
+    // process.resourcesPath points to the 'resources' directory.
+    return path.join(process.resourcesPath, 'bin', binaryName);
+};
 
 function createWindow() {
     const iconPath = path.join(__dirname, 'logo', process.platform === 'win32' ? 'logo.ico' : 'logo.icns');
@@ -53,7 +82,6 @@ function parseCsvLine(line) {
     for (let i = 0; i < line.length; i++) {
         const char = line[i];
         if (char === '"') {
-            // If we encounter a quote, check if it's an escaped quote ("")
             if (inQuotes && line[i+1] === '"') {
                 current += '"';
                 i++; // Skip the next quote
@@ -77,36 +105,27 @@ function splitCsvToLines(csvString) {
     let inQuotes = false;
     let currentRowStart = 0;
 
-    // Normalize line endings and trim whitespace
     const text = csvString.trim().replace(/\r\n/g, '\n');
 
     for (let i = 0; i < text.length; i++) {
         const char = text[i];
-
         if (char === '"') {
-            // Check for an escaped quote ("")
             if (inQuotes && text[i + 1] === '"') {
-                i++; // Skip the second quote of the pair
+                i++; 
             } else {
                 inQuotes = !inQuotes;
             }
         }
-
-        // A newline character is a row separator only if we're not inside quotes
         if (char === '\n' && !inQuotes) {
             rows.push(text.substring(currentRowStart, i));
             currentRowStart = i + 1;
         }
     }
-
-    // Add the very last line if it exists
     if (currentRowStart < text.length) {
         rows.push(text.substring(currentRowStart));
     }
-
     return rows;
 }
-
 
 // Fetches and parses the Google Sheet data.
 ipcMain.handle('fetch-sheet-data', () => {
@@ -142,12 +161,10 @@ ipcMain.handle('fetch-sheet-data', () => {
                     const headerNames = parseCsvLine(headerLine).map(h => h.replace(/^"|"$/g, '').trim());
                     log(`Using headers: [${headerNames.join(', ')}]`);
 
-                    // Define the new column names we need
                     const requiredIdHeader = 'ID';
                     const requiredGuideNameHeader = 'GUIDE_NAME';
                     const requiredPathHeader = 'PATH';
 
-                    // Find the index of our required columns
                     const idIndex = headerNames.findIndex(h => h.toUpperCase() === requiredIdHeader.toUpperCase());
                     const guideNameIndex = headerNames.findIndex(h => h.toUpperCase() === requiredGuideNameHeader.toUpperCase());
                     const pathIndex = headerNames.findIndex(h => h.toUpperCase() === requiredPathHeader.toUpperCase());
@@ -175,11 +192,11 @@ ipcMain.handle('fetch-sheet-data', () => {
 
                         const id = columns[idIndex];
                         const guideName = columns[guideNameIndex];
-                        const path = columns[pathIndex];
+                        const pathValue = columns[pathIndex];
                         if (id) {
                             shotDataMap[id] = {
                                 guideName: guideName || 'UNKNOWN_GUIDE_NAME',
-                                path: path || 'UNKNOWN_PATH'
+                                path: pathValue || 'UNKNOWN_PATH'
                             };
                         }
                     });
@@ -199,6 +216,78 @@ ipcMain.handle('fetch-sheet-data', () => {
     });
 });
 
+ipcMain.on('update-sheet-data', (event, { originalTitle, dur_f, dur_s, guide_version }) => {
+    if (!originalTitle) {
+        log('[WARNING] update-sheet-data called without an originalTitle. Cannot update sheet.');
+        return;
+    }
+
+    if (GOOGLE_APPS_SCRIPT_URL.includes('YOUR_DEPLOYMENT_ID')) {
+        log(`[INFO] Skipping Google Sheet update for "${originalTitle}" because GOOGLE_APPS_SCRIPT_URL is not configured.`);
+        return;
+    }
+
+    log(`Posting to Google Sheet for ID ${originalTitle}: DUR_F=${dur_f}, DUR_S=${dur_s}, GUIDE_V=${guide_version}`);
+
+    const postData = JSON.stringify({
+        id: originalTitle,
+        dur_f: dur_f,
+        dur_s: dur_s,
+        guide_v: guide_version // <<< FIX: Changed 'GUIDE_V' to 'guide_v' to match Apps Script
+    });
+    
+    const makeRequest = (url, method = 'POST', redirectCount = 0) => {
+        if (redirectCount > 5) {
+            log(`[ERROR] Exceeded max redirect limit for ID ${originalTitle}`);
+            return;
+        }
+
+        const urlObject = new URL(url);
+        const options = {
+            method: method,
+            headers: {
+                'Content-Type': 'application/json',
+            }
+        };
+
+        if (method === 'POST') {
+             options.headers['Content-Length'] = Buffer.byteLength(postData);
+        }
+
+        const req = https.request(urlObject, options, (res) => {
+            // Handle redirects from Google Apps Script
+            if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+                log(`Google Sheet API Redirect [${res.statusCode}] for ID ${originalTitle}. Following to: ${res.headers.location}`);
+                // Follow the redirect, but switch to GET as is standard for 302 redirects from a POST
+                makeRequest(res.headers.location, 'GET', redirectCount + 1);
+                res.resume(); // Consume the response data to free up memory
+                return;
+            }
+
+            let responseBody = '';
+            res.setEncoding('utf8');
+            res.on('data', (chunk) => { responseBody += chunk; });
+            res.on('end', () => {
+                log(`Google Sheet API Final Response [${res.statusCode}] for ID ${originalTitle}: ${responseBody}`);
+                if (res.statusCode < 200 || res.statusCode >= 300) {
+                    log(`[WARNING] Google Sheet update for ID ${originalTitle} may have failed with status ${res.statusCode}.`);
+                }
+            });
+        });
+
+        req.on('error', (e) => {
+            log(`[ERROR] Problem with Google Sheet request for ID ${originalTitle}: ${e.message}`);
+        });
+
+        if (method === 'POST') {
+            req.write(postData);
+        }
+        req.end();
+    };
+
+    makeRequest(GOOGLE_APPS_SCRIPT_URL);
+});
+
 
 ipcMain.on('log', (event, message) => {
     console.log(message);
@@ -208,10 +297,11 @@ ipcMain.on('log', (event, message) => {
 
 ipcMain.on('analyze-videos', async (event, filePaths) => {
     log('--- Starting video analysis ---');
-    const ffmpegPath = path.join(__dirname, 'bin', process.platform === 'win32' ? 'ffmpeg.exe' : 'ffmpeg');
-    if (!fs.existsSync(ffmpegPath)) {
-        const errorMsg = 'FFmpeg executable not found for analysis!';
-        log(errorMsg);
+    const ffprobePath = getBinaryPath(process.platform === 'win32' ? 'ffprobe.exe' : 'ffprobe');
+
+    if (!fs.existsSync(ffprobePath)) {
+        const errorMsg = 'ffprobe.exe executable not found for analysis!';
+        log(`[ERROR] Searched for ffprobe at: ${ffprobePath}`);
         dialog.showErrorBox('Error', errorMsg);
         mainWindow.webContents.send('processing-error', errorMsg);
         return;
@@ -221,7 +311,7 @@ ipcMain.on('analyze-videos', async (event, filePaths) => {
     for (const filePath of filePaths) {
         try {
             mainWindow.webContents.send('update-status', `Analyzing: ${path.basename(filePath)}`);
-            const chapters = await getChapters(ffmpegPath, filePath);
+            const chapters = await getChapters(ffprobePath, filePath);
             const chaptersWithContext = chapters.map((c, i) => ({
                 id: `ch-${path.basename(filePath)}-${i}`, // Unique ID for UI tracking
                 title: c.tags.title,
@@ -243,24 +333,55 @@ ipcMain.on('analyze-videos', async (event, filePaths) => {
     mainWindow.webContents.send('analyze-complete', allChapters);
 });
 
-ipcMain.on('process-videos', async (event, { chapters }) => {
-    const outputDir = path.join(__dirname, 'output');
-    if (!fs.existsSync(outputDir)) fs.mkdirSync(outputDir, { recursive: true });
+ipcMain.on('control-processing', (event, action) => {
+    log(`[CONTROL] Received: ${action}`);
+    if (action === 'pause') {
+        processingState.isPaused = true;
+        log('--- Processing Paused ---');
+        mainWindow.webContents.send('update-status', 'Paused...');
+    } else if (action === 'resume') {
+        processingState.isPaused = false;
+        log('--- Processing Resumed ---');
+        mainWindow.webContents.send('update-status', 'Processing...');
+    } else if (action === 'stop') {
+        processingState.shouldStop = true;
+        processingState.isPaused = false; // Release pause lock to allow loop to terminate
+        if (currentFfmpegProcess) {
+            log('--- User requested stop. Killing current FFmpeg process... ---');
+            currentFfmpegProcess.kill('SIGKILL'); 
+        } else {
+            log('--- User requested stop. No active FFmpeg process to kill. The queue will stop. ---');
+        }
+    }
+});
 
-    const ffmpegPath = path.join(__dirname, 'bin', process.platform === 'win32' ? 'ffmpeg.exe' : 'ffmpeg');
-    if (!fs.existsSync(ffmpegPath)) {
-        const errorMsg = 'FFmpeg executable not found!';
-        log(errorMsg);
+ipcMain.on('process-videos', async (event, { chapters }) => {
+    const outputBaseDir = 's:\\'; 
+    log(`--- Starting video processing. Base output directory: "${outputBaseDir}" ---`);
+    
+    const ffmpegPath = getBinaryPath(process.platform === 'win32' ? 'ffmpeg.exe' : 'ffmpeg');
+    const ffprobePath = getBinaryPath(process.platform === 'win32' ? 'ffprobe.exe' : 'ffprobe');
+
+    if (!fs.existsSync(ffmpegPath) || !fs.existsSync(ffprobePath)) {
+        const errorMsg = 'FFmpeg or FFprobe executables not found!';
+        log(`[ERROR] FFmpeg path: ${ffmpegPath} (Exists: ${fs.existsSync(ffmpegPath)})`);
+        log(`[ERROR] FFprobe path: ${ffprobePath} (Exists: ${fs.existsSync(ffprobePath)})`);
         dialog.showErrorBox('Error', errorMsg);
         mainWindow.webContents.send('processing-error', errorMsg);
         return;
     }
     
+    // Reset state for this run
+    processingState.isProcessing = true;
+    processingState.isPaused = false;
+    processingState.shouldStop = false;
+
     const videoInfos = {};
     for (const chapter of chapters) {
+        if (processingState.shouldStop) break;
         if (!videoInfos[chapter.sourceFile]) {
             try {
-                videoInfos[chapter.sourceFile] = await getVideoInfo(ffmpegPath, chapter.sourceFile);
+                videoInfos[chapter.sourceFile] = await getVideoInfo(ffprobePath, chapter.sourceFile);
             } catch (e) {
                 log(`Failed to get video info for ${chapter.sourceFile}: ${e.message}`);
                 mainWindow.webContents.send('processing-error', `Could not get info for ${chapter.sourceFile}`);
@@ -270,23 +391,51 @@ ipcMain.on('process-videos', async (event, { chapters }) => {
     }
     
     for (let i = 0; i < chapters.length; i++) {
-        const chapter = chapters[i];
-        const baseClipName = chapter.title.replace(/[ /\\?%*:|"<>]/g, '_');
-        
-        const videoSpecificOutputDir = path.join(outputDir, path.basename(chapter.sourceFile, path.extname(chapter.sourceFile)));
-        if (!fs.existsSync(videoSpecificOutputDir)) {
-            fs.mkdirSync(videoSpecificOutputDir, { recursive: true });
+        if (processingState.shouldStop) {
+            log('Processing loop stopped by user request.');
+            break; 
         }
 
-        // Find the next available version number
-        let version = 1;
+        while (processingState.isPaused) {
+            if (processingState.shouldStop) break;
+            await new Promise(resolve => setTimeout(resolve, 500));
+        }
+        if (processingState.shouldStop) {
+            log('Processing loop stopped by user request after pause.');
+            break;
+        }
+
+        const chapter = chapters[i];
         let finalClipName;
+        
+        let chapterOutputDir;
+        if (chapter.path && chapter.path !== 'UNKNOWN_PATH' && chapter.path.trim() !== '') {
+            const sanitizedPath = chapter.path.replace(/[:*?"<>|]/g, '');
+            chapterOutputDir = path.join(outputBaseDir, sanitizedPath);
+        } else {
+            log(`[WARNING] Chapter "${chapter.title}" has an invalid or missing path. Saving to a fallback directory.`);
+            const fallbackDirName = path.basename(chapter.sourceFile, path.extname(chapter.sourceFile));
+            chapterOutputDir = path.join(outputBaseDir, '_UNMATCHED', fallbackDirName);
+        }
+        log(`Target directory for "${chapter.title}" is: "${chapterOutputDir}"`);
+
+        try {
+            fs.mkdirSync(chapterOutputDir, { recursive: true });
+            log(`Ensured directory exists: "${chapterOutputDir}"`);
+        } catch (error) {
+            log(`[FATAL ERROR] Could not create directory "${chapterOutputDir}". Error: ${error.message}. Skipping this chapter.`);
+            mainWindow.webContents.send('chapter-update', { chapterId: chapter.id, status: 'Error' });
+            continue;
+        }
+
+        const baseClipName = chapter.title.replace(/[ /\\?%*:|"<>]/g, '_');
+        let version = 1;
         while (true) {
             const versionString = `v${String(version).padStart(3, '0')}`;
             finalClipName = `${baseClipName}-${versionString}`;
-            const prospectivePath = path.join(videoSpecificOutputDir, `${finalClipName}.mov`);
+            const prospectivePath = path.join(chapterOutputDir, `${finalClipName}.mp4`);
             if (!fs.existsSync(prospectivePath)) {
-                break; // Found an available filename
+                break;
             }
             version++;
         }
@@ -296,7 +445,7 @@ ipcMain.on('process-videos', async (event, { chapters }) => {
             chapterId: chapter.id,
             status: 'Processing',
             message: `Processing: ${finalClipName}`,
-            finalName: finalClipName // Pass the final name to the renderer
+            finalName: finalClipName
         });
         
         try {
@@ -307,21 +456,42 @@ ipcMain.on('process-videos', async (event, { chapters }) => {
             const nextChapterInFile = chapters.find((c, j) => j > i && c.sourceFile === chapter.sourceFile);
             const endTime = nextChapterInFile ? parseFloat(nextChapterInFile.start_time) : videoDuration;
             
-            // Pass a new chapter object with the final, versioned title to the processing function
             const finalChapter = { ...chapter, title: finalClipName };
-            await processSingleChapter(ffmpegPath, videoInfo, { ...finalChapter, startTime, endTime }, outputDir);
+            const result = await processSingleChapter(ffmpegPath, ffprobePath, videoInfo, { ...finalChapter, startTime, endTime }, chapterOutputDir);
             
-            mainWindow.webContents.send('chapter-update', { chapterId: chapter.id, status: 'Done' });
+            log(`Chapter ${finalClipName} processed. DUR_S: ${result.durationSeconds}, DUR_F: ${result.durationFrames}, GUIDE_V: ${version}`);
+            
+            mainWindow.webContents.send('chapter-update', {
+                chapterId: chapter.id,
+                status: 'Done',
+                durationSeconds: result.durationSeconds,
+                durationFrames: result.durationFrames,
+                guide_version: version
+            });
 
         } catch (error) {
+            if (processingState.shouldStop) {
+                log(`Processing of chapter ${finalClipName} was intentionally stopped.`);
+                mainWindow.webContents.send('chapter-update', { chapterId: chapter.id, status: 'Stopped' });
+                break; 
+            }
             log(`[ERROR] Failed to process chapter ${finalClipName}. Error: ${error.message}`);
             mainWindow.webContents.send('chapter-update', { chapterId: chapter.id, status: 'Error' });
-            mainWindow.webContents.send('processing-error', `Failed on chapter: ${finalClipName}`);
-            return;
         }
     }
 
-    mainWindow.webContents.send('processing-complete');
+    if (processingState.shouldStop) {
+        log('--- Processing was stopped by the user. ---');
+        mainWindow.webContents.send('processing-stopped');
+    } else {
+        log('--- All chapters have been processed. ---');
+        mainWindow.webContents.send('processing-complete');
+    }
+    
+    processingState.isProcessing = false;
+    processingState.isPaused = false;
+    processingState.shouldStop = false;
+    currentFfmpegProcess = null;
 });
 
 
@@ -331,12 +501,15 @@ function log(message) {
         mainWindow.webContents.send('log-message', message);
     }
     const logPath = path.join(app.getPath('userData'), 'app.log');
-    fs.appendFileSync(logPath, `${new Date().toISOString()} - ${message}\n`);
+    try {
+        fs.appendFileSync(logPath, `${new Date().toISOString()} - ${message}\n`);
+    } catch (error) {
+        console.error("Failed to write to log file:", error);
+    }
 }
 
-function getChapters(ffmpegPath, filePath) {
+function getChapters(ffprobePath, filePath) {
     return new Promise((resolve, reject) => {
-        const ffprobePath = ffmpegPath.replace('ffmpeg', 'ffprobe');
         const args = ['-i', filePath, '-print_format', 'json', '-show_chapters', '-loglevel', 'error'];
         log(`Running ffprobe: ${ffprobePath} ${args.join(' ')}`);
 
@@ -356,10 +529,11 @@ function getChapters(ffmpegPath, filePath) {
     });
 }
 
-async function processSingleChapter(ffmpegPath, videoInfo, chapter, outputDir) {
+async function processSingleChapter(ffmpegPath, ffprobePath, videoInfo, chapter, chapterOutputDir) {
     const { sourceFile, title, startTime, endTime } = chapter;
     const clipName = title.replace(/[ /\\?%*:|"<>]/g, '_');
     log(`\n--- Processing Chapter: ${clipName} from ${path.basename(sourceFile)} ---`);
+    log(`Output directory: ${chapterOutputDir}`);
     log(`[DEBUG] Chapter Times: Start=${startTime}s, End=${endTime}s`);
 
     const videoStream = videoInfo.streams.find(s => s.codec_type === 'video');
@@ -374,15 +548,10 @@ async function processSingleChapter(ffmpegPath, videoInfo, chapter, outputDir) {
     const frameDuration = 1 / frameRate;
     const tenFramesDuration = 10 * frameDuration;
     
-    const videoSpecificOutputDir = path.join(outputDir, path.basename(sourceFile, path.extname(sourceFile)));
-    if (!fs.existsSync(videoSpecificOutputDir)) {
-        fs.mkdirSync(videoSpecificOutputDir, { recursive: true });
-    }
-
-    const outputFilePath = path.join(videoSpecificOutputDir, `${clipName}.mov`);
-    const prefixStillPath = path.join(videoSpecificOutputDir, `prefix_${clipName}.png`);
-    const suffixStillPath = path.join(videoSpecificOutputDir, `suffix_${clipName}.png`);
-    const metadataFilePath = path.join(videoSpecificOutputDir, `metadata_${clipName}.txt`);
+    const outputFilePath = path.join(chapterOutputDir, `${clipName}.mp4`);
+    const prefixStillPath = path.join(chapterOutputDir, `prefix_${clipName}.png`);
+    const suffixStillPath = path.join(chapterOutputDir, `suffix_${clipName}.png`);
+    const metadataFilePath = path.join(chapterOutputDir, `metadata_${clipName}.txt`);
     
     try {
         await createStillFrame(ffmpegPath, sourceFile, startTime, prefixStillPath);
@@ -440,28 +609,95 @@ async function processSingleChapter(ffmpegPath, videoInfo, chapter, outputDir) {
             '-filter_complex', filterComplexString, '-map', '[out_v]'
         ];
         if (hasAudio) ffmpegArgs.push('-map', '[out_a]');
-        ffmpegArgs.push('-map_chapters', '3', '-c:v', 'prores_ks', '-profile:v', '3');
-        if (hasAudio) ffmpegArgs.push('-c:a', 'pcm_s16le');
+        
+        // --- START: ENCODING OPTIONS BASED ON MEDIAINFO ---
+        ffmpegArgs.push(
+            '-brand', 'mp42', // To get Codec ID: mp42
+            '-map_chapters', '3',
+            '-metadata', `creation_time=2025-09-08T10:10:38Z`,
+            
+            // Video options
+            '-c:v', 'libx264',
+            '-profile:v', 'main',
+            '-level', '4.1',
+            '-pix_fmt', 'yuv420p',
+            '-refs', '3',
+            '-b:v', '2465k',
+            '-maxrate', '2694k',
+            '-bufsize', '5388k', // Typically 2x maxrate
+            '-g', '1', // GOP size from mediainfo (N=1)
+            '-timecode', '10:00:08:17',
+            '-metadata:s:v:0', 'handler_name=AVC Coding', // Set writing library
+            '-metadata:s:v:0', 'language=eng'
+        );
+
+        // Audio options
+        if (hasAudio) {
+            ffmpegArgs.push(
+                '-c:a', 'aac',
+                '-b:a', '192k',
+                '-ac', '2',
+                '-ar', '48000',
+                '-metadata:s:a:0', 'language=eng'
+            );
+        }
+        // --- END: ENCODING OPTIONS ---
+
         ffmpegArgs.push('-y', outputFilePath);
 
         await runFfmpeg(ffmpegPath, ffmpegArgs);
-        log(`--- Successfully created: ${outputFilePath} ---\n`);
+        log(`--- Successfully created: ${outputFilePath} ---`);
+        
+        // Get the duration of the newly created clip for accurate logging
+        log(`Getting duration for exported clip: ${path.basename(outputFilePath)}`);
+        const newClipInfo = await getVideoInfo(ffprobePath, outputFilePath);
+        const newClipVideoStream = newClipInfo.streams.find(s => s.codec_type === 'video');
+
+        if (!newClipInfo.format || !newClipInfo.format.duration || !newClipVideoStream || !newClipVideoStream.r_frame_rate) {
+            log('[WARNING] Could not get precise duration from the exported clip. Reporting as 0.');
+            return { durationFrames: 0, durationSeconds: 0 };
+        }
+
+        const durationSecondsFloat = parseFloat(newClipInfo.format.duration);
+        const newFrameRate = eval(newClipVideoStream.r_frame_rate);
+        const durationFrames = Math.round(durationSecondsFloat * newFrameRate);
+        const durationSeconds = Math.round(durationSecondsFloat);
+        
+        log(`Exported clip duration: ${durationSecondsFloat.toFixed(3)}s (${durationSeconds}s rounded), ${durationFrames} frames.`);
+
+        return { durationFrames, durationSeconds };
+
     } finally {
-        if (fs.existsSync(prefixStillPath)) fs.unlinkSync(prefixStillPath);
-        if (fs.existsSync(suffixStillPath)) fs.unlinkSync(suffixStillPath);
-        if (fs.existsSync(metadataFilePath)) fs.unlinkSync(metadataFilePath);
+        // Safely clean up temporary files
+        log(`Cleaning up temporary files for ${clipName}...`);
+        for (const file of [prefixStillPath, suffixStillPath, metadataFilePath]) {
+            try {
+                if (fs.existsSync(file)) {
+                    fs.unlinkSync(file);
+                    log(`Deleted temp file: ${file}`);
+                }
+            } catch (error) {
+                log(`[WARNING] Could not delete temporary file: ${file}. Error: ${error.message}`);
+            }
+        }
     }
 }
 
 function createStillFrame(ffmpegPath, filePath, time, outputPath) {
     const seekTime = Math.max(0, time);
-    const args = ['-ss', seekTime.toString(), '-i', filePath, '-vframes', '1', '-y', outputPath];
+    // Add a drawbox filter to place a filled red 50x50 square in the top-right corner.
+    const args = [
+        '-ss', seekTime.toString(),
+        '-i', filePath,
+        '-vf', 'drawbox=x=iw-w-10:y=10:w=50:h=50:color=red:t=fill',
+        '-vframes', '1',
+        '-y', outputPath
+    ];
     return runFfmpeg(ffmpegPath, args);
 }
 
-function getVideoInfo(ffmpegPath, filePath) {
+function getVideoInfo(ffprobePath, filePath) {
     return new Promise((resolve, reject) => {
-        const ffprobePath = ffmpegPath.replace('ffmpeg', 'ffprobe');
         const args = ['-v', 'quiet', '-print_format', 'json', '-show_format', '-show_streams', filePath];
         log(`Running ffprobe: ${ffprobePath} ${args.join(' ')}`);
 
@@ -482,14 +718,32 @@ function getVideoInfo(ffmpegPath, filePath) {
 
 function runFfmpeg(ffmpegPath, args) {
     return new Promise((resolve, reject) => {
+        log(`Running FFmpeg: ${ffmpegPath} ${args.join(' ')}`);
         const ffmpeg = spawn(ffmpegPath, args);
+        currentFfmpegProcess = ffmpeg;
+        let stderr = '';
+
         ffmpeg.stdout.on('data', (data) => log(`ffmpeg stdout: ${data}`));
-        ffmpeg.stderr.on('data', (data) => log(`ffmpeg stderr: ${data}`));
+        ffmpeg.stderr.on('data', (data) => {
+            const str = data.toString();
+            log(`ffmpeg stderr: ${str}`);
+            stderr += str;
+        });
+
         ffmpeg.on('close', (code) => {
-            if (code !== 0) return reject(new Error(`FFmpeg process exited with code ${code}`));
+            currentFfmpegProcess = null;
+            if (processingState.shouldStop) {
+                return reject(new Error('FFmpeg process was stopped by the user.'));
+            }
+            if (code !== 0) {
+                return reject(new Error(`FFmpeg process exited with code ${code}\n\nFFmpeg output:\n${stderr}`));
+            }
             resolve();
         });
-        ffmpeg.on('error', (err) => reject(err));
+
+        ffmpeg.on('error', (err) => {
+            currentFfmpegProcess = null;
+            reject(err);
+        });
     });
 }
-
