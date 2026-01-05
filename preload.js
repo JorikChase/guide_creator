@@ -4,6 +4,7 @@ const { contextBridge, ipcRenderer } = require('electron');
 contextBridge.exposeInMainWorld('electronAPI', {
     log: (message) => ipcRenderer.send('log', message),
     quitApp: () => ipcRenderer.send('app:quit'),
+    toggleDebug: (enabled) => ipcRenderer.send('toggle-debug', enabled),
     openFileDialog: () => ipcRenderer.invoke('dialog:openFile'),
     fetchSheetData: () => ipcRenderer.invoke('fetch-sheet-data'),
     updateSheetData: (data) => ipcRenderer.send('update-sheet-data', data),

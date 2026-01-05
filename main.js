@@ -1,23 +1,22 @@
 // main.js - Main Electron process
-
-// Handle creating/removing shortcuts on Windows when installing/uninstalling.
-// This is required for packages created with the squirrel maker.
-if (require('electron-squirrel-startup')) {
-  app.quit();
-}
-
 const { app, BrowserWindow, ipcMain, dialog } = require('electron');
 const path = require('path');
 const { spawn } = require('child_process');
 const fs = require('fs');
 const https = require('https');
 
+// Handle creating/removing shortcuts on Windows when installing/uninstalling.
+if (require('electron-squirrel-startup')) {
+  app.quit();
+}
+
 const GOOGLE_APPS_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbz9I11vPIkxX-mEyUk2tMLCSC01t9p4lFnTSaFbDTozIUlBTjMmuWtxzPspvTSitoIh/exec';
 
 let mainWindow;
 
-// --- State Management for Processing ---
+// --- State Management ---
 let currentFfmpegProcess = null;
+let debugMode = false;
 let processingState = {
     isProcessing: false,
     isPaused: false,
@@ -28,11 +27,8 @@ let processingState = {
 const isDev = !app.isPackaged;
 const getBinaryPath = (binaryName) => {
     if (isDev) {
-        // In development, assume 'bin' is in the project root
         return path.join(__dirname, 'bin', binaryName);
     }
-    // In a packaged app, binaries are in the 'resources/bin' directory.
-    // process.resourcesPath points to the 'resources' directory.
     return path.join(process.resourcesPath, 'bin', binaryName);
 };
 
@@ -65,6 +61,15 @@ app.on('window-all-closed', () => {
 // --- IPC Handlers ---
 
 ipcMain.on('app:quit', () => app.quit());
+
+ipcMain.on('toggle-debug', (event, enabled) => {
+    debugMode = enabled;
+    if (debugMode && mainWindow) {
+        mainWindow.webContents.openDevTools();
+    } else if (mainWindow) {
+        mainWindow.webContents.closeDevTools();
+    }
+});
 
 ipcMain.handle('dialog:openFile', async () => {
     const { canceled, filePaths } = await dialog.showOpenDialog(mainWindow, {
@@ -104,9 +109,7 @@ function splitCsvToLines(csvString) {
     const rows = [];
     let inQuotes = false;
     let currentRowStart = 0;
-
     const text = csvString.trim().replace(/\r\n/g, '\n');
-
     for (let i = 0; i < text.length; i++) {
         const char = text[i];
         if (char === '"') {
@@ -222,18 +225,13 @@ ipcMain.on('update-sheet-data', (event, { originalTitle, dur_f, dur_s, guide_ver
         return;
     }
 
-    if (GOOGLE_APPS_SCRIPT_URL.includes('YOUR_DEPLOYMENT_ID')) {
-        log(`[INFO] Skipping Google Sheet update for "${originalTitle}" because GOOGLE_APPS_SCRIPT_URL is not configured.`);
-        return;
-    }
-
     log(`Posting to Google Sheet for ID ${originalTitle}: DUR_F=${dur_f}, DUR_S=${dur_s}, GUIDE_V=${guide_version}`);
 
     const postData = JSON.stringify({
         id: originalTitle,
         dur_f: dur_f,
         dur_s: dur_s,
-        guide_v: guide_version // <<< FIX: Changed 'GUIDE_V' to 'guide_v' to match Apps Script
+        guide_v: guide_version
     });
     
     const makeRequest = (url, method = 'POST', redirectCount = 0) => {
@@ -245,9 +243,7 @@ ipcMain.on('update-sheet-data', (event, { originalTitle, dur_f, dur_s, guide_ver
         const urlObject = new URL(url);
         const options = {
             method: method,
-            headers: {
-                'Content-Type': 'application/json',
-            }
+            headers: { 'Content-Type': 'application/json' }
         };
 
         if (method === 'POST') {
@@ -255,12 +251,10 @@ ipcMain.on('update-sheet-data', (event, { originalTitle, dur_f, dur_s, guide_ver
         }
 
         const req = https.request(urlObject, options, (res) => {
-            // Handle redirects from Google Apps Script
             if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
                 log(`Google Sheet API Redirect [${res.statusCode}] for ID ${originalTitle}. Following to: ${res.headers.location}`);
-                // Follow the redirect, but switch to GET as is standard for 302 redirects from a POST
                 makeRequest(res.headers.location, 'GET', redirectCount + 1);
-                res.resume(); // Consume the response data to free up memory
+                res.resume();
                 return;
             }
 
@@ -284,15 +278,7 @@ ipcMain.on('update-sheet-data', (event, { originalTitle, dur_f, dur_s, guide_ver
         }
         req.end();
     };
-
     makeRequest(GOOGLE_APPS_SCRIPT_URL);
-});
-
-
-ipcMain.on('log', (event, message) => {
-    console.log(message);
-    const logPath = path.join(app.getPath('userData'), 'app.log');
-    fs.appendFileSync(logPath, `${new Date().toISOString()} - ${message}\n`);
 });
 
 ipcMain.on('analyze-videos', async (event, filePaths) => {
@@ -313,7 +299,7 @@ ipcMain.on('analyze-videos', async (event, filePaths) => {
             mainWindow.webContents.send('update-status', `Analyzing: ${path.basename(filePath)}`);
             const chapters = await getChapters(ffprobePath, filePath);
             const chaptersWithContext = chapters.map((c, i) => ({
-                id: `ch-${path.basename(filePath)}-${i}`, // Unique ID for UI tracking
+                id: `ch-${path.basename(filePath)}-${i}`,
                 title: c.tags.title,
                 start_time: c.start_time,
                 sourceFile: filePath,
@@ -333,31 +319,51 @@ ipcMain.on('analyze-videos', async (event, filePaths) => {
     mainWindow.webContents.send('analyze-complete', allChapters);
 });
 
+function killFfmpeg(reason = 'unknown') {
+    if (!currentFfmpegProcess || currentFfmpegProcess.killed) {
+        log(`killFfmpeg called for reason "${reason}", but no process was found or it was already killed.`);
+        return;
+    }
+    const pid = currentFfmpegProcess.pid;
+    log(`Attempting to kill FFmpeg process with PID: ${pid} for reason: ${reason}`);
+    
+    if (process.platform === 'win32') {
+        spawn('taskkill', ['/pid', pid, '/f', '/t']);
+    } else {
+        // Kill the entire process group by negating the PID
+        try {
+            process.kill(-pid, 'SIGKILL');
+        } catch (e) {
+            log(`Could not kill process group ${-pid}, falling back to single process ${pid}. Error: ${e.message}`);
+            currentFfmpegProcess.kill('SIGKILL');
+        }
+    }
+    
+    currentFfmpegProcess = null;
+}
+
 ipcMain.on('control-processing', (event, action) => {
     log(`[CONTROL] Received: ${action}`);
     if (action === 'pause') {
         processingState.isPaused = true;
         log('--- Processing Paused ---');
         mainWindow.webContents.send('update-status', 'Paused...');
+        killFfmpeg('pause');
     } else if (action === 'resume') {
         processingState.isPaused = false;
         log('--- Processing Resumed ---');
         mainWindow.webContents.send('update-status', 'Processing...');
     } else if (action === 'stop') {
         processingState.shouldStop = true;
-        processingState.isPaused = false; // Release pause lock to allow loop to terminate
-        if (currentFfmpegProcess) {
-            log('--- User requested stop. Killing current FFmpeg process... ---');
-            currentFfmpegProcess.kill('SIGKILL'); 
-        } else {
-            log('--- User requested stop. No active FFmpeg process to kill. The queue will stop. ---');
-        }
+        processingState.isPaused = false;
+        log('--- User requested stop. Killing current FFmpeg process... ---');
+        killFfmpeg('stop');
     }
 });
 
 ipcMain.on('process-videos', async (event, { chapters }) => {
-    const outputBaseDir = 's:\\'; 
-    log(`--- Starting video processing. Base output directory: "${outputBaseDir}" ---`);
+    const baseDir = debugMode ? 'S:\\3212-PREPRODUCTION_TEST' : 'S:\\3212-PREPRODUCTION';
+    log(`--- Starting video processing. Debug: ${debugMode}. Output: "${baseDir}" ---`);
     
     const ffmpegPath = getBinaryPath(process.platform === 'win32' ? 'ffmpeg.exe' : 'ffmpeg');
     const ffprobePath = getBinaryPath(process.platform === 'win32' ? 'ffprobe.exe' : 'ffprobe');
@@ -411,11 +417,11 @@ ipcMain.on('process-videos', async (event, { chapters }) => {
         let chapterOutputDir;
         if (chapter.path && chapter.path !== 'UNKNOWN_PATH' && chapter.path.trim() !== '') {
             const sanitizedPath = chapter.path.replace(/[:*?"<>|]/g, '');
-            chapterOutputDir = path.join(outputBaseDir, sanitizedPath);
+            chapterOutputDir = path.join(baseDir, sanitizedPath).toUpperCase();
         } else {
             log(`[WARNING] Chapter "${chapter.title}" has an invalid or missing path. Saving to a fallback directory.`);
             const fallbackDirName = path.basename(chapter.sourceFile, path.extname(chapter.sourceFile));
-            chapterOutputDir = path.join(outputBaseDir, '_UNMATCHED', fallbackDirName);
+            chapterOutputDir = path.join(baseDir, '_UNMATCHED', fallbackDirName).toUpperCase();
         }
         log(`Target directory for "${chapter.title}" is: "${chapterOutputDir}"`);
 
@@ -432,7 +438,7 @@ ipcMain.on('process-videos', async (event, { chapters }) => {
         let version = 1;
         while (true) {
             const versionString = `v${String(version).padStart(3, '0')}`;
-            finalClipName = `${baseClipName}-${versionString}`;
+            finalClipName = `${baseClipName}-${versionString}`.toLowerCase();
             const prospectivePath = path.join(chapterOutputDir, `${finalClipName}.mp4`);
             if (!fs.existsSync(prospectivePath)) {
                 break;
@@ -470,11 +476,19 @@ ipcMain.on('process-videos', async (event, { chapters }) => {
             });
 
         } catch (error) {
-            if (processingState.shouldStop) {
+            if (error.message === 'paused') {
+                log(`Processing paused at chapter ${finalClipName}. Will re-attempt on resume.`);
+                mainWindow.webContents.send('chapter-update', { chapterId: chapter.id, status: 'Paused' });
+                i--; // The loop will increment, so we decrement to stay on the same chapter
+                continue; // Go to top of loop and hit the `while(isPaused)` block
+            }
+            
+            if (processingState.shouldStop || error.message === 'stopped') {
                 log(`Processing of chapter ${finalClipName} was intentionally stopped.`);
                 mainWindow.webContents.send('chapter-update', { chapterId: chapter.id, status: 'Stopped' });
                 break; 
             }
+            
             log(`[ERROR] Failed to process chapter ${finalClipName}. Error: ${error.message}`);
             mainWindow.webContents.send('chapter-update', { chapterId: chapter.id, status: 'Error' });
         }
@@ -494,6 +508,7 @@ ipcMain.on('process-videos', async (event, { chapters }) => {
     currentFfmpegProcess = null;
 });
 
+// --- Helper Functions ---
 
 function log(message) {
     console.log(message);
@@ -512,7 +527,6 @@ function getChapters(ffprobePath, filePath) {
     return new Promise((resolve, reject) => {
         const args = ['-i', filePath, '-print_format', 'json', '-show_chapters', '-loglevel', 'error'];
         log(`Running ffprobe: ${ffprobePath} ${args.join(' ')}`);
-
         const ffprobe = spawn(ffprobePath, args);
         let output = '';
         ffprobe.stdout.on('data', (data) => output += data);
@@ -531,29 +545,30 @@ function getChapters(ffprobePath, filePath) {
 
 async function processSingleChapter(ffmpegPath, ffprobePath, videoInfo, chapter, chapterOutputDir) {
     const { sourceFile, title, startTime, endTime } = chapter;
-    const clipName = title.replace(/[ /\\?%*:|"<>]/g, '_');
+    const clipName = title; // Already lowercased
     log(`\n--- Processing Chapter: ${clipName} from ${path.basename(sourceFile)} ---`);
     log(`Output directory: ${chapterOutputDir}`);
-    log(`[DEBUG] Chapter Times: Start=${startTime}s, End=${endTime}s`);
 
     const videoStream = videoInfo.streams.find(s => s.codec_type === 'video');
-    const audioStream = videoInfo.streams.find(s => s.codec_type === 'audio');
-    const hasAudio = !!audioStream;
     if (!videoStream || !videoStream.r_frame_rate) {
         throw new Error('Could not determine frame rate for the video.');
     }
     
-    const originalFrameRateString = videoStream.r_frame_rate;
-    const frameRate = eval(originalFrameRateString);
-    const frameDuration = 1 / frameRate;
-    const tenFramesDuration = 10 * frameDuration;
-    
     const outputFilePath = path.join(chapterOutputDir, `${clipName}.mp4`);
-    const prefixStillPath = path.join(chapterOutputDir, `prefix_${clipName}.png`);
-    const suffixStillPath = path.join(chapterOutputDir, `suffix_${clipName}.png`);
-    const metadataFilePath = path.join(chapterOutputDir, `metadata_${clipName}.txt`);
     
     try {
+        const originalFrameRateString = videoStream.r_frame_rate;
+        const frameRate = eval(originalFrameRateString);
+        const frameDuration = 1 / frameRate;
+        const tenFramesDuration = 10 * frameDuration;
+        const audioStream = videoInfo.streams.find(s => s.codec_type === 'audio');
+        const hasAudio = !!audioStream;
+
+        const prefixStillPath = path.join(chapterOutputDir, `prefix_${clipName}.png`);
+        const suffixStillPath = path.join(chapterOutputDir, `suffix_${clipName}.png`);
+        const metadataFilePath = path.join(chapterOutputDir, `metadata_${clipName}.txt`);
+        
+        // Create still frames at the target 540p resolution.
         await createStillFrame(ffmpegPath, sourceFile, startTime, prefixStillPath);
         const suffixTime = Math.max(startTime, endTime - frameDuration);
         await createStillFrame(ffmpegPath, sourceFile, suffixTime, suffixStillPath);
@@ -567,8 +582,12 @@ async function processSingleChapter(ffmpegPath, ffprobePath, videoInfo, chapter,
 
         const complexFilterParts = [];
         const videoTrimEndTime = Math.max(startTime, endTime - frameDuration);
+
+        // The still images (inputs 1 and 2) are already scaled to 540p by createStillFrame.
         complexFilterParts.push(`[1:v]loop=loop=9:size=1:start=0,setpts=PTS-STARTPTS[pre_v]`);
-        complexFilterParts.push(`[0:v]trim=start=${startTime}:end=${videoTrimEndTime},setpts=PTS-STARTPTS[main_v]`);
+        // Trim the main video (input 0), then scale it to 960x540.
+        // Changed from -2:480 to 960:540
+        complexFilterParts.push(`[0:v]trim=start=${startTime}:end=${videoTrimEndTime},setpts=PTS-STARTPTS,scale=960:540[main_v]`);
         complexFilterParts.push(`[2:v]loop=loop=9:size=1:start=0,setpts=PTS-STARTPTS[suf_v]`);
 
         if (hasAudio) {
@@ -583,10 +602,8 @@ async function processSingleChapter(ffmpegPath, ffprobePath, videoInfo, chapter,
                 complexFilterParts.push(`[0:a]atrim=start=${audioPrefixStartTime}:end=${startTime},asetpts=PTS-STARTPTS[pre_a]`);
             }
             audioParts.push('[pre_a]');
-
             complexFilterParts.push(`[0:a]atrim=start=${startTime}:end=${endTime},asetpts=PTS-STARTPTS[main_a]`);
             audioParts.push('[main_a]');
-
             const videoDuration = parseFloat(videoInfo.format.duration);
             const isLastChapterInFile = endTime > (videoDuration - frameDuration);
             if (isLastChapterInFile) {
@@ -596,13 +613,13 @@ async function processSingleChapter(ffmpegPath, ffprobePath, videoInfo, chapter,
                 complexFilterParts.push(`[0:a]atrim=start=${endTime}:end=${audioSuffixEndTime},asetpts=PTS-STARTPTS[suf_a]`);
             }
             audioParts.push('[suf_a]');
-            
             complexFilterParts.push(`${audioParts.join('')}concat=n=${audioParts.length}:v=0:a=1[out_a]`);
         }
-
-        complexFilterParts.push(`[pre_v][main_v][suf_v]concat=n=3:v=1,fps=${originalFrameRateString}[out_v]`);
         
+        // Concatenate the prefix, main, and suffix video streams. All are now 540p.
+        complexFilterParts.push(`[pre_v][main_v][suf_v]concat=n=3:v=1,fps=${originalFrameRateString}[out_v]`);
         const filterComplexString = complexFilterParts.join(';');
+
         const ffmpegArgs = [
             '-i', sourceFile, '-framerate', originalFrameRateString, '-i', prefixStillPath,
             '-framerate', originalFrameRateString, '-i', suffixStillPath, '-i', metadataFilePath,
@@ -610,46 +627,27 @@ async function processSingleChapter(ffmpegPath, ffprobePath, videoInfo, chapter,
         ];
         if (hasAudio) ffmpegArgs.push('-map', '[out_a]');
         
-        // --- START: ENCODING OPTIONS BASED ON MEDIAINFO ---
+        // Encoding settings adjusted for 540p output.
+        // Updated settings: 3Mbps VBR, GOP=1
         ffmpegArgs.push(
-            '-brand', 'mp42', // To get Codec ID: mp42
-            '-map_chapters', '3',
-            '-metadata', `creation_time=2025-09-08T10:10:38Z`,
-            
-            // Video options
-            '-c:v', 'libx264',
-            '-profile:v', 'main',
-            '-level', '4.1',
-            '-pix_fmt', 'yuv420p',
-            '-refs', '3',
-            '-b:v', '2465k',
-            '-maxrate', '2694k',
-            '-bufsize', '5388k', // Typically 2x maxrate
-            '-g', '1', // GOP size from mediainfo (N=1)
-            '-timecode', '10:00:08:17',
-            '-metadata:s:v:0', 'handler_name=AVC Coding', // Set writing library
-            '-metadata:s:v:0', 'language=eng'
+            '-brand', 'mp42', '-map_chapters', '3',
+            '-c:v', 'libx264', '-profile:v', 'main', '-level', '3.1', '-pix_fmt', 'yuv420p',
+            '-g', '1', // Keyframe every frame (All-Intra)
+            '-b:v', '3000k', '-maxrate', '4500k', '-bufsize', '6000k', // 3Mbps VBR
+            '-metadata:s:v:0', 'handler_name=AVC Coding', '-metadata:s:v:0', 'language=eng'
         );
 
-        // Audio options
         if (hasAudio) {
             ffmpegArgs.push(
-                '-c:a', 'aac',
-                '-b:a', '192k',
-                '-ac', '2',
-                '-ar', '48000',
+                '-c:a', 'aac', '-b:a', '192k', '-ac', '2', '-ar', '48000',
                 '-metadata:s:a:0', 'language=eng'
             );
         }
-        // --- END: ENCODING OPTIONS ---
-
         ffmpegArgs.push('-y', outputFilePath);
 
         await runFfmpeg(ffmpegPath, ffmpegArgs);
         log(`--- Successfully created: ${outputFilePath} ---`);
         
-        // Get the duration of the newly created clip for accurate logging
-        log(`Getting duration for exported clip: ${path.basename(outputFilePath)}`);
         const newClipInfo = await getVideoInfo(ffprobePath, outputFilePath);
         const newClipVideoStream = newClipInfo.streams.find(s => s.codec_type === 'video');
 
@@ -663,14 +661,12 @@ async function processSingleChapter(ffmpegPath, ffprobePath, videoInfo, chapter,
         const durationFrames = Math.round(durationSecondsFloat * newFrameRate);
         const durationSeconds = Math.round(durationSecondsFloat);
         
-        log(`Exported clip duration: ${durationSecondsFloat.toFixed(3)}s (${durationSeconds}s rounded), ${durationFrames} frames.`);
-
         return { durationFrames, durationSeconds };
 
     } finally {
         // Safely clean up temporary files
         log(`Cleaning up temporary files for ${clipName}...`);
-        for (const file of [prefixStillPath, suffixStillPath, metadataFilePath]) {
+        for (const file of [path.join(chapterOutputDir, `prefix_${clipName}.png`), path.join(chapterOutputDir, `suffix_${clipName}.png`), path.join(chapterOutputDir, `metadata_${clipName}.txt`)]) {
             try {
                 if (fs.existsSync(file)) {
                     fs.unlinkSync(file);
@@ -685,13 +681,12 @@ async function processSingleChapter(ffmpegPath, ffprobePath, videoInfo, chapter,
 
 function createStillFrame(ffmpegPath, filePath, time, outputPath) {
     const seekTime = Math.max(0, time);
-    // Add a drawbox filter to place a filled red 50x50 square in the top-right corner.
+    // Scale the still frame to 960:540 to match the main video output.
+    // The drawbox filter is applied after scaling.
     const args = [
-        '-ss', seekTime.toString(),
-        '-i', filePath,
-        '-vf', 'drawbox=x=iw-w-10:y=10:w=50:h=50:color=red:t=fill',
-        '-vframes', '1',
-        '-y', outputPath
+        '-ss', seekTime.toString(), '-i', filePath,
+        '-vf', 'scale=960:540,drawbox=x=0:y=75:w=100:h=50:color=red:t=fill',
+        '-vframes', '1', '-y', outputPath
     ];
     return runFfmpeg(ffmpegPath, args);
 }
@@ -699,8 +694,6 @@ function createStillFrame(ffmpegPath, filePath, time, outputPath) {
 function getVideoInfo(ffprobePath, filePath) {
     return new Promise((resolve, reject) => {
         const args = ['-v', 'quiet', '-print_format', 'json', '-show_format', '-show_streams', filePath];
-        log(`Running ffprobe: ${ffprobePath} ${args.join(' ')}`);
-
         const ffprobe = spawn(ffprobePath, args);
         let output = '';
         ffprobe.stdout.on('data', (data) => output += data);
@@ -718,8 +711,8 @@ function getVideoInfo(ffprobePath, filePath) {
 
 function runFfmpeg(ffmpegPath, args) {
     return new Promise((resolve, reject) => {
-        log(`Running FFmpeg: ${ffmpegPath} ${args.join(' ')}`);
-        const ffmpeg = spawn(ffmpegPath, args);
+        log(`Running FFmpeg: ${path.basename(ffmpegPath)} ${args.join(' ')}`);
+        const ffmpeg = spawn(ffmpegPath, args, { detached: process.platform !== 'win32' });
         currentFfmpegProcess = ffmpeg;
         let stderr = '';
 
@@ -733,7 +726,10 @@ function runFfmpeg(ffmpegPath, args) {
         ffmpeg.on('close', (code) => {
             currentFfmpegProcess = null;
             if (processingState.shouldStop) {
-                return reject(new Error('FFmpeg process was stopped by the user.'));
+                return reject(new Error('stopped'));
+            }
+            if (processingState.isPaused) {
+                return reject(new Error('paused'));
             }
             if (code !== 0) {
                 return reject(new Error(`FFmpeg process exited with code ${code}\n\nFFmpeg output:\n${stderr}`));

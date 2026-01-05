@@ -11,7 +11,15 @@
             <div class="container">
                 <div class="title-bar">
                     <div class="title">FFMPEG GUIDE CREATOR</div>
-                    <button id="close-btn" class="close-btn">&times;</button>
+                    <div class="title-bar-controls">
+                        <div class="debug-controls">
+                            <label class="toggle-switch">
+                                <input type="checkbox" id="debug-toggle">
+                                <span class="slider"></span>
+                            </label>
+                        </div>
+                        <button id="close-btn" class="close-btn">&times;</button>
+                    </div>
                 </div>
                 <div id="drag-drop-area" class="drag-drop-area">
                     <p>DRAG & DROP .MOV FILES</p>
@@ -48,3 +56,4 @@
     <script src="renderer.js"></script>
 </body>
 </html>
+

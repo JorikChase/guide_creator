@@ -13,10 +13,11 @@ document.addEventListener('DOMContentLoaded', () => {
     const processingControls = document.getElementById('processing-controls');
     const pauseBtn = document.getElementById('pause-btn');
     const stopBtn = document.getElementById('stop-btn');
+    const debugToggle = document.getElementById('debug-toggle');
     
     // --- State Variables ---
     let filePaths = [];
-    let chapters = []; // To store the analyzed chapters
+    let chapters = [];
     let isProcessing = false;
 
     function log(message) {
@@ -118,9 +119,15 @@ document.addEventListener('DOMContentLoaded', () => {
         updateButtonStates();
     }
     
-    // --- Window Controls ---
+    // --- Window & App Controls ---
     closeBtn.addEventListener('click', () => {
         window.electronAPI.quitApp();
+    });
+
+    debugToggle.addEventListener('change', () => {
+        const isEnabled = debugToggle.checked;
+        log(`Debug mode toggled: ${isEnabled ? 'ON' : 'OFF'}`);
+        window.electronAPI.toggleDebug(isEnabled);
     });
 
     // --- Core Actions ---
@@ -182,7 +189,6 @@ document.addEventListener('DOMContentLoaded', () => {
     // --- IPC Listeners from Main Process ---
     window.electronAPI.onLogMessage((message) => {
         logOutput.textContent += message + '\n';
-        // Correctly scroll the log output element, not its parent
         logOutput.scrollTop = logOutput.scrollHeight;
     });
 
@@ -224,7 +230,7 @@ document.addEventListener('DOMContentLoaded', () => {
                     log(`Success: Matched ID "${originalTitle}". New name is "${sheetData.guideName}".`);
                 } else {
                     log(`[WARNING] No match found for ID "${originalTitle}" in the Google Sheet. Using original name.`);
-                    chapter.originalTitle = originalTitle; // Still store it for unmatched items
+                    chapter.originalTitle = originalTitle;
                 }
             });
 
@@ -240,40 +246,78 @@ document.addEventListener('DOMContentLoaded', () => {
 
     function renderChapterList() {
         chapterListDiv.innerHTML = '';
+
+        if (chapters.length === 0) return;
+
+        // --- 1. Create Sticky Header Row (Select All) ---
+        const headerItem = document.createElement('div');
+        headerItem.className = 'chapter-list-header';
+
+        const headerCheckboxContainer = document.createElement('label');
+        headerCheckboxContainer.className = 'checkbox-container';
+        
+        const headerCheckbox = document.createElement('input');
+        headerCheckbox.type = 'checkbox';
+        // Check "Select All" box if ALL chapters are currently selected
+        headerCheckbox.checked = chapters.every(c => c.selected);
+        
+        const headerCustomCheckbox = document.createElement('span');
+        headerCustomCheckbox.className = 'custom-checkbox';
+        headerCheckboxContainer.appendChild(headerCheckbox);
+        headerCheckboxContainer.appendChild(headerCustomCheckbox);
+
+        const headerLabel = document.createElement('span');
+        headerLabel.textContent = 'SELECT / DESELECT ALL';
+        headerLabel.style.flexGrow = '1'; // Occupy remaining space to be clickable
+
+        // Toggle All Logic (attached to checkbox change)
+        headerCheckbox.addEventListener('change', () => {
+            const isChecked = headerCheckbox.checked;
+            chapters.forEach(c => c.selected = isChecked);
+            renderChapterList(); // Re-render to update all UI states
+            updateButtonStates();
+        });
+
+        // Click anywhere on header to toggle
+        headerItem.addEventListener('click', (e) => {
+            // Avoid double-toggle if clicking the checkbox itself
+            if (e.target.closest('.checkbox-container')) return;
+            
+            headerCheckbox.checked = !headerCheckbox.checked;
+            // Trigger change event logic manually
+            headerCheckbox.dispatchEvent(new Event('change'));
+        });
+
+        headerItem.appendChild(headerCheckboxContainer);
+        headerItem.appendChild(headerLabel);
+        chapterListDiv.appendChild(headerItem);
+
+
+        // --- 2. Create Individual Chapter Rows ---
         chapters.forEach((chapter, index) => {
             const chapterItem = document.createElement('div');
             chapterItem.className = 'chapter-item';
             chapterItem.dataset.chapterId = chapter.id;
             
-            // Add initial class if not selected
             if (!chapter.selected) {
                 chapterItem.classList.add('unchecked');
             }
 
-            // --- Checkbox ---
+            // Checkbox
             const checkboxContainer = document.createElement('label');
             checkboxContainer.className = 'checkbox-container';
-
             const checkbox = document.createElement('input');
             checkbox.type = 'checkbox';
             checkbox.checked = chapter.selected;
-            checkbox.addEventListener('change', () => {
-                chapters[index].selected = checkbox.checked;
-                // Toggle class on the parent chapter item
-                chapterItem.classList.toggle('unchecked', !checkbox.checked);
-                updateButtonStates();
-            });
-
+            
             const customCheckbox = document.createElement('span');
             customCheckbox.className = 'custom-checkbox';
-
             checkboxContainer.appendChild(checkbox);
             checkboxContainer.appendChild(customCheckbox);
-            // --- End Checkbox ---
 
+            // Info
             const chapterInfo = document.createElement('div');
             chapterInfo.className = 'chapter-info';
-
             const chapterName = document.createElement('span');
             chapterName.className = 'chapter-name';
             
@@ -291,11 +335,43 @@ document.addEventListener('DOMContentLoaded', () => {
             chapterInfo.appendChild(chapterName);
             chapterInfo.appendChild(chapterPath);
 
+            // Status
             const chapterStatus = document.createElement('span');
             chapterStatus.className = 'chapter-status chapter-status-ready';
             chapterStatus.textContent = 'Ready';
 
-            chapterItem.appendChild(checkboxContainer); // Add checkbox to the item
+            // --- Logic: Update Header Checkbox ---
+            function updateHeaderState() {
+                const allSelected = chapters.every(c => c.selected);
+                headerCheckbox.checked = allSelected;
+            }
+
+            // --- Logic: Row Click Event (Click Anywhere) ---
+            chapterItem.addEventListener('click', (e) => {
+                // If clicking the checkbox directly, let the change listener handle it
+                if (e.target.closest('.checkbox-container')) return;
+
+                // Toggle State
+                chapter.selected = !chapter.selected;
+                
+                // Update UI Elements
+                checkbox.checked = chapter.selected;
+                chapterItem.classList.toggle('unchecked', !chapter.selected);
+                
+                updateHeaderState();
+                updateButtonStates();
+            });
+
+            // --- Logic: Checkbox Click Event ---
+            checkbox.addEventListener('change', () => {
+                chapters[index].selected = checkbox.checked;
+                chapterItem.classList.toggle('unchecked', !checkbox.checked);
+                
+                updateHeaderState();
+                updateButtonStates();
+            });
+
+            chapterItem.appendChild(checkboxContainer);
             chapterItem.appendChild(chapterInfo);
             chapterItem.appendChild(chapterStatus);
             chapterListDiv.appendChild(chapterItem);
@@ -366,4 +442,3 @@ document.addEventListener('DOMContentLoaded', () => {
         resetProcessingUI();
     });
 });
-

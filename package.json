@@ -1,6 +1,6 @@
 {
   "name": "ffmpeg-guide-creator",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "An Electron application to split QuickTime videos based on Adobe Premiere Pro chapter markers.",
   "main": "main.js",
   "scripts": {
