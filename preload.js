@@ -18,4 +18,6 @@ contextBridge.exposeInMainWorld('electronAPI', {
     onProcessingError: (callback) => ipcRenderer.on('processing-error', (event, ...args) => callback(...args)),
     onAnalyzeComplete: (callback) => ipcRenderer.on('analyze-complete', (event, ...args) => callback(...args)),
     onChapterUpdate: (callback) => ipcRenderer.on('chapter-update', (event, ...args) => callback(...args)),
+    // New listener for Sheet responses
+    onSheetUpdateResponse: (callback) => ipcRenderer.on('sheet-update-response', (event, ...args) => callback(...args)),
 });

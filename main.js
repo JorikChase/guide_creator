@@ -10,7 +10,7 @@ if (require('electron-squirrel-startup')) {
   app.quit();
 }
 
-const GOOGLE_APPS_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbz9I11vPIkxX-mEyUk2tMLCSC01t9p4lFnTSaFbDTozIUlBTjMmuWtxzPspvTSitoIh/exec';
+const GOOGLE_APPS_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbz4_IstItFMaHbVMcOoTpXEugqpliK_q3ZaDFA6I9Ds_5_AnrKT3kkvc564Z1WXXkMe/exec';
 
 let mainWindow;
 
@@ -187,8 +187,9 @@ ipcMain.handle('fetch-sheet-data', () => {
                         const columns = parseCsvLine(line).map(c => c.replace(/^"|"$/g, '').trim());
                         
                         if (columns.length <= Math.max(idIndex, guideNameIndex, pathIndex)) {
+                            // Only warn if the line isn't empty
                             if (line.trim() !== '') {
-                                log(`[WARNING] Skipping row ${rowIndex + 2} due to insufficient columns: "${line}"`);
+                                log(`[WARNING] Skipping row ${rowIndex + 2} due to insufficient columns.`);
                             }
                             return;
                         }
@@ -234,9 +235,12 @@ ipcMain.on('update-sheet-data', (event, { originalTitle, dur_f, dur_s, guide_ver
         guide_v: guide_version
     });
     
+    // Recursive function to handle 302 redirects from Google Script
     const makeRequest = (url, method = 'POST', redirectCount = 0) => {
         if (redirectCount > 5) {
-            log(`[ERROR] Exceeded max redirect limit for ID ${originalTitle}`);
+            const errorMsg = `[ERROR] Exceeded max redirect limit for ID ${originalTitle}`;
+            log(errorMsg);
+            if(mainWindow) mainWindow.webContents.send('sheet-update-response', { originalTitle, success: false, message: 'Too many redirects' });
             return;
         }
 
@@ -251,10 +255,11 @@ ipcMain.on('update-sheet-data', (event, { originalTitle, dur_f, dur_s, guide_ver
         }
 
         const req = https.request(urlObject, options, (res) => {
+            // Handle Redirects (302/303)
             if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-                log(`Google Sheet API Redirect [${res.statusCode}] for ID ${originalTitle}. Following to: ${res.headers.location}`);
+                // Follow redirect using GET (Google Script behavior)
                 makeRequest(res.headers.location, 'GET', redirectCount + 1);
-                res.resume();
+                res.resume(); // Consume data to free memory
                 return;
             }
 
@@ -262,15 +267,36 @@ ipcMain.on('update-sheet-data', (event, { originalTitle, dur_f, dur_s, guide_ver
             res.setEncoding('utf8');
             res.on('data', (chunk) => { responseBody += chunk; });
             res.on('end', () => {
-                log(`Google Sheet API Final Response [${res.statusCode}] for ID ${originalTitle}: ${responseBody}`);
-                if (res.statusCode < 200 || res.statusCode >= 300) {
-                    log(`[WARNING] Google Sheet update for ID ${originalTitle} may have failed with status ${res.statusCode}.`);
+                log(`Google Sheet API Response for ${originalTitle}: ${responseBody}`);
+                
+                let parsedResponse;
+                try {
+                    parsedResponse = JSON.parse(responseBody);
+                } catch(e) {
+                    // HTML error page or raw text
+                    parsedResponse = { status: 'error', message: `Invalid JSON: ${responseBody.substring(0, 50)}...` };
+                }
+
+                // Send success/fail status back to UI
+                if (mainWindow) {
+                    mainWindow.webContents.send('sheet-update-response', {
+                        originalTitle: originalTitle,
+                        success: parsedResponse.status === 'success',
+                        message: parsedResponse.message || 'Unknown result'
+                    });
                 }
             });
         });
 
         req.on('error', (e) => {
-            log(`[ERROR] Problem with Google Sheet request for ID ${originalTitle}: ${e.message}`);
+            log(`[ERROR] Network error for ID ${originalTitle}: ${e.message}`);
+            if (mainWindow) {
+                mainWindow.webContents.send('sheet-update-response', {
+                    originalTitle: originalTitle,
+                    success: false,
+                    message: `Network Error: ${e.message}`
+                });
+            }
         });
 
         if (method === 'POST') {
@@ -302,6 +328,7 @@ ipcMain.on('analyze-videos', async (event, filePaths) => {
                 id: `ch-${path.basename(filePath)}-${i}`,
                 title: c.tags.title,
                 start_time: c.start_time,
+                end_time: c.end_time, // Added end_time for robust processing
                 sourceFile: filePath,
                 fileName: path.basename(filePath)
             }));
@@ -459,8 +486,16 @@ ipcMain.on('process-videos', async (event, { chapters }) => {
             const videoDuration = parseFloat(videoInfo.format.duration);
             const startTime = parseFloat(chapter.start_time);
             
-            const nextChapterInFile = chapters.find((c, j) => j > i && c.sourceFile === chapter.sourceFile);
-            const endTime = nextChapterInFile ? parseFloat(nextChapterInFile.start_time) : videoDuration;
+            // Prioritize explicit end_time from chapter (requires re-analyze).
+            // Fallback to "Next Chapter" logic for legacy or missing data.
+            // Fallback to video duration as last resort.
+            let endTime;
+            if (chapter.end_time) {
+                endTime = parseFloat(chapter.end_time);
+            } else {
+                const nextChapterInFile = chapters.find((c, j) => j > i && c.sourceFile === chapter.sourceFile);
+                endTime = nextChapterInFile ? parseFloat(nextChapterInFile.start_time) : videoDuration;
+            }
             
             const finalChapter = { ...chapter, title: finalClipName };
             const result = await processSingleChapter(ffmpegPath, ffprobePath, videoInfo, { ...finalChapter, startTime, endTime }, chapterOutputDir);
@@ -558,7 +593,20 @@ async function processSingleChapter(ffmpegPath, ffprobePath, videoInfo, chapter,
     
     try {
         const originalFrameRateString = videoStream.r_frame_rate;
-        const frameRate = eval(originalFrameRateString);
+        let frameRate = 30;
+        try {
+            frameRate = eval(originalFrameRateString);
+        } catch(e) { 
+            log(`[WARNING] Failed to eval frame rate string "${originalFrameRateString}". Defaulting to 30.`);
+        }
+        
+        // Sanity check for frame rate. If it's something wild (like 0 or > 200), default to 30.
+        // This prevents the "0.00000033" frame duration bug.
+        if (!frameRate || !isFinite(frameRate) || frameRate <= 0 || frameRate > 240) {
+             log(`[WARNING] Detected potentially unsafe frame rate: ${frameRate}. Defaulting to 30.`);
+             frameRate = 30;
+        }
+
         const frameDuration = 1 / frameRate;
         const tenFramesDuration = 10 * frameDuration;
         const audioStream = videoInfo.streams.find(s => s.codec_type === 'audio');
@@ -570,8 +618,31 @@ async function processSingleChapter(ffmpegPath, ffprobePath, videoInfo, chapter,
         
         // Create still frames at the target 540p resolution.
         await createStillFrame(ffmpegPath, sourceFile, startTime, prefixStillPath);
+        
+        // Suffix generation with retry logic
+        // Use explicit end time from analysis if available, otherwise fallback logic handles it.
         const suffixTime = Math.max(startTime, endTime - frameDuration);
-        await createStillFrame(ffmpegPath, sourceFile, suffixTime, suffixStillPath);
+        
+        // Log info for debugging
+        log(`Generating suffix at ${suffixTime} (EndTime: ${endTime}, FrameDur: ${frameDuration})`);
+
+        try {
+            await createStillFrame(ffmpegPath, sourceFile, suffixTime, suffixStillPath);
+            // Verify output - FFmpeg often returns 0 even if it failed to seek to a valid frame
+            if (!fs.existsSync(suffixStillPath) || fs.statSync(suffixStillPath).size === 0) {
+                throw new Error("Generated suffix file is empty");
+            }
+        } catch (e) {
+            log(`[WARNING] Suffix generation failed at ${suffixTime}. Retrying with slight offset... Error: ${e.message}`);
+            // Backup by 3 frames worth to be safe
+            const safeSuffixTime = Math.max(startTime, suffixTime - (frameDuration * 3));
+            await createStillFrame(ffmpegPath, sourceFile, safeSuffixTime, suffixStillPath);
+            
+            // Validate again
+            if (!fs.existsSync(suffixStillPath) || fs.statSync(suffixStillPath).size === 0) {
+                throw new Error("Retry failed: Generated suffix file is still empty.");
+            }
+        }
 
         const chapterDuration = endTime - startTime;
         const newChapterStartTime = tenFramesDuration;
@@ -586,8 +657,8 @@ async function processSingleChapter(ffmpegPath, ffprobePath, videoInfo, chapter,
         // The still images (inputs 1 and 2) are already scaled to 540p by createStillFrame.
         complexFilterParts.push(`[1:v]loop=loop=9:size=1:start=0,setpts=PTS-STARTPTS[pre_v]`);
         // Trim the main video (input 0), then scale it to 960x540.
-        // Changed from -2:480 to 960:540
-        complexFilterParts.push(`[0:v]trim=start=${startTime}:end=${videoTrimEndTime},setpts=PTS-STARTPTS,scale=960:540[main_v]`);
+        // MODIFICATION: Added flags=lanczos+accurate_rnd for better scaling quality and stability
+        complexFilterParts.push(`[0:v]trim=start=${startTime}:end=${videoTrimEndTime},setpts=PTS-STARTPTS,scale=960:540:flags=lanczos+accurate_rnd[main_v]`);
         complexFilterParts.push(`[2:v]loop=loop=9:size=1:start=0,setpts=PTS-STARTPTS[suf_v]`);
 
         if (hasAudio) {
@@ -634,6 +705,8 @@ async function processSingleChapter(ffmpegPath, ffprobePath, videoInfo, chapter,
             '-c:v', 'libx264', '-profile:v', 'main', '-level', '3.1', '-pix_fmt', 'yuv420p',
             '-g', '1', // Keyframe every frame (All-Intra)
             '-b:v', '3000k', '-maxrate', '4500k', '-bufsize', '6000k', // 3Mbps VBR
+            // MODIFICATION: Added Color Tags (bt709) to fix gamma shift and contrast issues
+            '-color_primaries', 'bt709', '-color_trc', 'bt709', '-colorspace', 'bt709',
             '-metadata:s:v:0', 'handler_name=AVC Coding', '-metadata:s:v:0', 'language=eng'
         );
 
@@ -683,10 +756,13 @@ function createStillFrame(ffmpegPath, filePath, time, outputPath) {
     const seekTime = Math.max(0, time);
     // Scale the still frame to 960:540 to match the main video output.
     // The drawbox filter is applied after scaling.
+    // Added -update 1 to satisfy "image sequence pattern" requirement for single images
+    // MODIFICATION: Updated scaler to lanczos+accurate_rnd for consistency and quality
     const args = [
         '-ss', seekTime.toString(), '-i', filePath,
-        '-vf', 'scale=960:540,drawbox=x=0:y=75:w=100:h=50:color=red:t=fill',
-        '-vframes', '1', '-y', outputPath
+        // x=101 (101px from left), y=ih-43 (20px from bottom: ih - 20 - 23 = ih - 43), w=13, h=23
+        '-vf', 'scale=960:540:flags=lanczos+accurate_rnd,drawbox=x=88:y=ih-43:w=13:h=23:color=red:t=fill',
+        '-vframes', '1', '-update', '1', '-y', outputPath
     ];
     return runFfmpeg(ffmpegPath, args);
 }
