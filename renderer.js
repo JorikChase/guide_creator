@@ -19,6 +19,7 @@ document.addEventListener('DOMContentLoaded', () => {
     let filePaths = [];
     let chapters = [];
     let isProcessing = false;
+    let isOverwriteMode = false;
 
     function log(message) {
         console.log(message);
@@ -156,7 +157,7 @@ document.addEventListener('DOMContentLoaded', () => {
             pauseBtn.textContent = 'PAUSE';
             stopBtn.disabled = false;
 
-            window.electronAPI.processVideos({ chapters: selectedChapters });
+            window.electronAPI.processVideos({ chapters: selectedChapters, overwrite: isOverwriteMode });
         } else {
             log("Cannot process: No chapters have been selected.");
         }
@@ -187,8 +188,16 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     // --- IPC Listeners from Main Process ---
+    const MAX_LOG_LINES = 1000;
     window.electronAPI.onLogMessage((message) => {
-        logOutput.textContent += message + '\n';
+        const line = document.createElement('div');
+        line.textContent = message;
+        logOutput.appendChild(line);
+
+        if (logOutput.childNodes.length > MAX_LOG_LINES) {
+            logOutput.removeChild(logOutput.firstChild);
+        }
+
         logOutput.scrollTop = logOutput.scrollHeight;
     });
 
@@ -270,6 +279,33 @@ document.addEventListener('DOMContentLoaded', () => {
         headerLabel.textContent = 'SELECT / DESELECT ALL';
         headerLabel.style.flexGrow = '1'; // Occupy remaining space to be clickable
 
+        // --- Overwrite Control Group (Right Side) ---
+        const overwriteGroup = document.createElement('div');
+        overwriteGroup.className = 'overwrite-control-group';
+
+        const overwriteLabel = document.createElement('span');
+        overwriteLabel.className = 'overwrite-label';
+        overwriteLabel.textContent = 'OVERWRITE';
+
+        const overwriteBtn = document.createElement('button');
+        overwriteBtn.className = 'recycle-btn';
+        if (isOverwriteMode) overwriteBtn.classList.add('active');
+        overwriteBtn.title = 'OVERWRITE MODE';
+        
+        const recycleIcon = document.createElement('div');
+        recycleIcon.className = 'recycle-icon';
+        overwriteBtn.appendChild(recycleIcon);
+
+        overwriteBtn.addEventListener('click', (e) => {
+            e.stopPropagation(); // Don't trigger Select All
+            isOverwriteMode = !isOverwriteMode;
+            overwriteBtn.classList.toggle('active', isOverwriteMode);
+            log(`Overwrite mode toggled: ${isOverwriteMode ? 'ON' : 'OFF'}`);
+        });
+
+        overwriteGroup.appendChild(overwriteLabel);
+        overwriteGroup.appendChild(overwriteBtn);
+
         // Toggle All Logic (attached to checkbox change)
         headerCheckbox.addEventListener('change', () => {
             const isChecked = headerCheckbox.checked;
@@ -290,6 +326,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
         headerItem.appendChild(headerCheckboxContainer);
         headerItem.appendChild(headerLabel);
+        headerItem.appendChild(overwriteGroup);
         chapterListDiv.appendChild(headerItem);
 
 
@@ -407,16 +444,18 @@ document.addEventListener('DOMContentLoaded', () => {
                 let chapterInfo = chapterItem.querySelector('.chapter-info');
                 chapterInfo.appendChild(durationEl);
 
-                if (chapter.originalTitle) {
-                    log(`Chapter "${chapter.title}" finished. Sending data to Google Sheet for ID "${chapter.originalTitle}".`);
+                const sheetRowId = update.sheetRowId || chapter.originalTitle;
+                if (sheetRowId) {
+                    log(`Chapter "${chapter.title}" finished. Sending data to Google Sheet for ID "${sheetRowId}".`);
                     window.electronAPI.updateSheetData({
-                        originalTitle: chapter.originalTitle,
+                        chapterId: chapter.id,
+                        sheetRowId: sheetRowId,
                         dur_f: update.durationFrames,
                         dur_s: update.durationSeconds,
                         guide_version: update.guide_version
                     });
                 } else {
-                    log(`Chapter "${chapter.title}" finished, but has no originalTitle. Cannot update Google Sheet.`);
+                    log(`Chapter "${chapter.title}" finished, but has no identifiable Sheet ID. Cannot update Google Sheet.`);
                 }
             }
         }
