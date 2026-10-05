@@ -1,6 +1,6 @@
 {
   "name": "krutart-guide-creator",
-  "version": "1.4.9",
+  "version": "1.4.10",
   "description": "An Electron application to split QuickTime videos based on Adobe Premiere Pro chapter markers.",
   "main": "main.js",
   "scripts": {

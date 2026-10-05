@@ -261,9 +261,25 @@ ipcMain.handle('fetch-sheet-data', () => {
                                         folderName = columns[shotIdIndex].split('-sh')[0].toUpperCase();
                                     }
 
+                                    // Guard: the sheet's PATH formula sometimes loses the scene name and
+                                    // yields ".../SC20-/SC20-BASE/" (Sep 2026). Rebuild that segment from
+                                    // SHOT_ID, or send the guide to _UNMATCHED rather than a wrong folder.
+                                    let rowPath = columns[pathIndex] || 'UNKNOWN_PATH';
+                                    const brokenScene = rowPath.match(/\/(SC\d+)-\//i);
+                                    if (brokenScene) {
+                                        if (folderName.startsWith(`${brokenScene[1].toUpperCase()}-`) && folderName.length > brokenScene[1].length + 1) {
+                                            const repaired = rowPath.replace(brokenScene[0], `/${folderName}/`);
+                                            log(`[WARNING] PATH for "${id}" has no scene name ("${rowPath}"). Using "${repaired}" from SHOT_ID.`, true);
+                                            rowPath = repaired;
+                                        } else {
+                                            log(`[WARNING] PATH for "${id}" has no scene name ("${rowPath}") and SHOT_ID can't fix it. Sending to _UNMATCHED.`, true);
+                                            rowPath = 'UNKNOWN_PATH';
+                                        }
+                                    }
+
                                     shotDataMap[id] = {
                                         guideName: columns[guideNameIndex] || 'UNKNOWN_GUIDE_NAME',
-                                        path: columns[pathIndex] || 'UNKNOWN_PATH',
+                                        path: rowPath,
                                         sceneName: folderName,
                                         shotId: columns[shotIdIndex] || 'UNKNOWN_SHOT_ID'
                                     };
