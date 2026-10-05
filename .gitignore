@@ -6,4 +6,5 @@ package-lock.json
 dist/
 release-builds/
 out/
-.electron/
+.electron/.env
+guide_creator/
